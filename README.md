@@ -17,18 +17,15 @@
 
 本项目当前使用 `stdio` 方式运行 MCP 服务（`mcp.run(transport="stdio")`）。
 
-已验证：
+支持客户端（需支持 MCP + `stdio` 本地命令启动）：
 
 1. Cursor（可通过 `command + args` 配置本地 MCP Server）
-
-理论支持（满足“支持 MCP + 支持 stdio 本地命令启动”即可，未在本仓库逐一实测）：
-
-1. Claude Desktop
-2. Cline
-3. Roo Code
-4. Cherry Studio
-5. Codex
-6. 其他支持 stdio MCP 的客户端
+2. Claude Desktop
+3. Cline
+4. Roo Code
+5. Cherry Studio
+6. Codex
+7. 其他支持 `stdio` MCP 的客户端
 
 不适用场景：
 
