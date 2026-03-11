@@ -13,6 +13,26 @@
 - 按位数自动选择调试器（`x96dbg` 会根据目标 PE 自动选择 `x32dbg/x64dbg`）。
 - 启动增强：插件依赖检查、非 ASCII 目标路径自动复制兜底。
 
+## 支持客户端
+
+本项目当前使用 `stdio` 方式运行 MCP 服务（`mcp.run(transport="stdio")`）。
+
+已验证：
+
+1. Cursor（可通过 `command + args` 配置本地 MCP Server）
+
+理论支持（满足“支持 MCP + 支持 stdio 本地命令启动”即可，未在本仓库逐一实测）：
+
+1. Claude Desktop
+2. Cline
+3. Roo Code
+4. Cherry Studio
+5. 其他支持 stdio MCP 的客户端
+
+不适用场景：
+
+1. 仅支持 SSE/HTTP 远程 MCP、但不支持 stdio 本地进程启动的客户端。
+
 ## 完整部署（Windows）
 
 ### 1）安装前置依赖
