@@ -6,7 +6,7 @@
         "-m",
         "xdbg_mcp",
         "--xdbg-path",
-        "D:\\tools\\x64dbg\\release\\x96dbg.exe"
+        "<X64DBG_DIR>\\x96dbg.exe"
       ]
     }
   }

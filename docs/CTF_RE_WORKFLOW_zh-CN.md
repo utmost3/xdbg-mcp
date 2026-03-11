@@ -28,7 +28,7 @@
 ## 3. 快速启动
 
 ```powershell
-python -m xdbg_mcp --xdbg-path D:\tools\x64dbg\release\x96dbg.exe
+python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 ```
 
 首次连通建议调用顺序：

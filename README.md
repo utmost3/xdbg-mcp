@@ -20,7 +20,7 @@
 1. 安装 Python `3.11+`。
 2. 安装 x64dbg 发行包，确保包含 `x32dbg.exe`、`x64dbg.exe`、`x96dbg.exe`。
 3. 安装 Git（用于拉取本项目）。
-4. 确认调试器目录，例如 `D:\tools\x64dbg\release`。
+4. 确认调试器目录（下文用 `<X64DBG_DIR>` 表示），例如 `C:\tools\x64dbg\release`。
 
 ### 2）安装 x64dbg automate 插件文件
 
@@ -43,11 +43,11 @@
 
 ```text
 # 结构 A（单层 release）
-D:\tools\x64dbg\release\plugins\
+<X64DBG_DIR>\plugins\
 
 # 结构 B（分 x32/x64 子目录）
-D:\tools\x64dbg\release\x32\plugins\
-D:\tools\x64dbg\release\x64\plugins\
+<X64DBG_DIR>\x32\plugins\
+<X64DBG_DIR>\x64\plugins\
 ```
 
 放完后再启动 `xdbg-mcp`。如果仍报 `Missing x64dbg automate plugin dependencies`，按报错中给出的绝对路径放置即可。
@@ -71,12 +71,12 @@ python -m pip install -e .
 可任选以下命令：
 
 ```powershell
-set XDBG_PATH=D:\tools\x64dbg\release\x96dbg.exe
+set XDBG_PATH=<X64DBG_DIR>\x96dbg.exe
 xdbg-mcp
 ```
 
 ```powershell
-python -m xdbg_mcp --xdbg-path D:\tools\x64dbg\release\x96dbg.exe
+python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 ```
 
 ### 6）MCP 客户端配置示例
@@ -92,7 +92,7 @@ python -m xdbg_mcp --xdbg-path D:\tools\x64dbg\release\x96dbg.exe
         "-m",
         "xdbg_mcp",
         "--xdbg-path",
-        "D:\\tools\\x64dbg\\release\\x96dbg.exe"
+        "<X64DBG_DIR>\\x96dbg.exe"
       ]
     }
   }
