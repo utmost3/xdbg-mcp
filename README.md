@@ -34,54 +34,23 @@
 
 1. 打开 `x64dbg-automate` 官方 Releases：  
 `https://github.com/dariushoule/x64dbg-automate/releases`
-2. 下载带有 `x64dbg-automate.dp32`、`x64dbg-automate.dp64`、`libzmq-mt-4_3_5.dll` 的插件压缩包。
-3. 解压后确认文件名与上面完全一致（尤其是 `dp32/dp64` 后缀）。
+2. 下载包含以下 3 个文件的压缩包并解压：
+: `x64dbg-automate.dp32`
+: `x64dbg-automate.dp64`
+: `libzmq-mt-4_3_5.dll`
 
-注意：`python -m pip install x64dbg_automate` 只会安装 Python 客户端，不会自动把 `dp32/dp64/libzmq` 放进你的 x64dbg `plugins` 目录，这一步必须手动完成。
-
-安装方式（PowerShell，建议直接复制）：
-
-```powershell
-# 你的 x64dbg 可执行文件路径（x32dbg/x64dbg/x96dbg 均可）
-$xdbgExe = "D:\tools\x64dbg\release\x96dbg.exe"
-
-# 你解压出的插件文件目录（里面要有 dp32/dp64/libzmq）
-$pluginSrc = "D:\Downloads\x64dbg-automate"
-
-# xdbg-mcp 会在“所选 exe 同级目录\plugins”查找插件
-$pluginsDir = Join-Path (Split-Path $xdbgExe -Parent) "plugins"
-New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
-
-Copy-Item (Join-Path $pluginSrc "x64dbg-automate.dp32") $pluginsDir -Force
-Copy-Item (Join-Path $pluginSrc "x64dbg-automate.dp64") $pluginsDir -Force
-Copy-Item (Join-Path $pluginSrc "libzmq-mt-4_3_5.dll") $pluginsDir -Force
-```
-
-安装后校验：
-
-```powershell
-Get-ChildItem $pluginsDir | Where-Object {
-  $_.Name -in @(
-    "x64dbg-automate.dp32",
-    "x64dbg-automate.dp64",
-    "libzmq-mt-4_3_5.dll"
-  )
-}
-```
-
-如果你使用的路径是目录（不是 exe），请保证最终会被选中的调试器 exe 与 `plugins` 目录同级。
-例如：
+把这 3 个文件放到你实际使用的调试器同级 `plugins` 目录下即可。常见目录如下（二选一，以你的安装结构为准）：
 
 ```text
-D:\tools\x64dbg\release\x32dbg.exe
-D:\tools\x64dbg\release\x64dbg.exe
-D:\tools\x64dbg\release\x96dbg.exe
-D:\tools\x64dbg\release\plugins\x64dbg-automate.dp32
-D:\tools\x64dbg\release\plugins\x64dbg-automate.dp64
-D:\tools\x64dbg\release\plugins\libzmq-mt-4_3_5.dll
+# 结构 A（单层 release）
+D:\tools\x64dbg\release\plugins\
+
+# 结构 B（分 x32/x64 子目录）
+D:\tools\x64dbg\release\x32\plugins\
+D:\tools\x64dbg\release\x64\plugins\
 ```
 
-最后再启动 `xdbg-mcp`。若仍报 `Missing x64dbg automate plugin dependencies`，按报错里给出的绝对路径放置文件即可。
+放完后再启动 `xdbg-mcp`。如果仍报 `Missing x64dbg automate plugin dependencies`，按报错中给出的绝对路径放置即可。
 
 ### 3）拉取项目源码
 
