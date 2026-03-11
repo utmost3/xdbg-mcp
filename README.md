@@ -27,7 +27,8 @@
 2. Cline
 3. Roo Code
 4. Cherry Studio
-5. 其他支持 stdio MCP 的客户端
+5. Codex
+6. 其他支持 stdio MCP 的客户端
 
 不适用场景：
 
