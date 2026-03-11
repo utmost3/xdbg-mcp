@@ -22,7 +22,8 @@
 
 1. 插件文件必须落到“你实际使用的 xdbg 可执行文件同级目录下的 `plugins`”。
 2. 只安装 Python 包不够，`dp32/dp64/libzmq` 仍需手动复制。
-3. 完整搭建步骤请先按 README 的“完整部署（Windows）”执行，再做本指南中的题目流程。
+3. 插件下载建议直接使用官方 Releases：`https://github.com/dariushoule/x64dbg-automate/releases`。
+4. 完整搭建步骤请先按 README 的“完整部署（Windows）”执行，再做本指南中的题目流程。
 
 ## 3. 快速启动
 

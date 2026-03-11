@@ -32,9 +32,9 @@
 
 获取方式：
 
-1. 打开 `x64dbg-automate-pyclient` 仓库：  
-`https://github.com/dariushoule/x64dbg-automate-pyclient`
-2. 在 Releases 或文档中下载带有上述 3 个文件的插件包。
+1. 打开 `x64dbg-automate` 官方 Releases：  
+`https://github.com/dariushoule/x64dbg-automate/releases`
+2. 下载带有 `x64dbg-automate.dp32`、`x64dbg-automate.dp64`、`libzmq-mt-4_3_5.dll` 的插件压缩包。
 3. 解压后确认文件名与上面完全一致（尤其是 `dp32/dp64` 后缀）。
 
 注意：`python -m pip install x64dbg_automate` 只会安装 Python 客户端，不会自动把 `dp32/dp64/libzmq` 放进你的 x64dbg `plugins` 目录，这一步必须手动完成。
