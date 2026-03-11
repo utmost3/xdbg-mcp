@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "xdbg": {
+      "command": "python",
+      "args": [
+        "-m",
+        "xdbg_mcp",
+        "--xdbg-path",
+        "D:\\tools\\x64dbg\\release\\x96dbg.exe"
+      ]
+    }
+  }
+}

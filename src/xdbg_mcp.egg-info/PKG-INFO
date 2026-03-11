@@ -1,0 +1,142 @@
+Metadata-Version: 2.4
+Name: xdbg-mcp
+Version: 0.1.0
+Summary: MCP server for x64dbg/x96dbg automation.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: mcp>=1.26.0
+Requires-Dist: x64dbg_automate>=0.7.5
+
+# xdbg-mcp
+
+MCP server for `x64dbg/x32dbg/x96dbg`, built on top of `x64dbg_automate`.
+
+## Capabilities
+
+- Session management: `list/start/connect/disconnect/terminate`.
+- Execution control: `go/pause/step_into/step_over/wait`.
+- Registers and memory read/write.
+- Software/hardware/memory breakpoints.
+- Disassemble and assemble at arbitrary addresses.
+- Auto-reconnect and retry for transient session failures.
+- Bitness-aware debugger selection (`x96dbg` auto-picks `x32dbg/x64dbg` by target PE).
+- Startup hardening: plugin dependency checks and non-ASCII target path fallback copy.
+
+## Full Deployment (Windows)
+
+### 1) Install prerequisites
+
+1. Install Python `3.11+`.
+2. Install x64dbg release package that includes `x32dbg.exe`, `x64dbg.exe`, `x96dbg.exe`.
+3. Confirm your debugger root path, for example `D:\tools\x64dbg\release`.
+
+### 2) Install x64dbg automate plugin files
+
+Put the following files into `<xdbg_release_dir>\plugins\`:
+
+1. `x64dbg-automate.dp32`
+2. `x64dbg-automate.dp64`
+3. `libzmq-mt-4_3_5.dll`
+
+Expected layout example:
+
+```text
+D:\tools\x64dbg\release\x32dbg.exe
+D:\tools\x64dbg\release\x64dbg.exe
+D:\tools\x64dbg\release\x96dbg.exe
+D:\tools\x64dbg\release\plugins\x64dbg-automate.dp32
+D:\tools\x64dbg\release\plugins\x64dbg-automate.dp64
+D:\tools\x64dbg\release\plugins\libzmq-mt-4_3_5.dll
+```
+
+### 3) Install this MCP server
+
+```powershell
+cd xdbg-mcp
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+### 4) Start MCP server
+
+Use either command:
+
+```powershell
+set XDBG_PATH=D:\tools\x64dbg\release\x96dbg.exe
+xdbg-mcp
+```
+
+```powershell
+python -m xdbg_mcp --xdbg-path D:\tools\x64dbg\release\x96dbg.exe
+```
+
+### 5) MCP client config example
+
+Copy this into your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "xdbg": {
+      "command": "python",
+      "args": [
+        "-m",
+        "xdbg_mcp",
+        "--xdbg-path",
+        "D:\\tools\\x64dbg\\release\\x96dbg.exe"
+      ]
+    }
+  }
+}
+```
+
+A copy is also provided in `mcp.client.json.example`.
+
+### 6) Smoke test after startup
+
+Run these calls in order:
+
+1. `health`
+2. `start_session` with `target_exe=<your_challenge.exe>`
+3. `debugger_status`
+4. `set_breakpoint` at a known address, then `go`
+
+If `health.connected=true` and `debugger_status` returns valid process/debugger info, deployment is complete.
+
+## Reliability Environment Flags
+
+- `XDBG_MCP_AUTO_RECONNECT=1|0`  
+Enable/disable automatic reconnect to local sessions after transient failures. Default: `1`.
+- `XDBG_MCP_RETRY_ATTEMPTS=<int>`  
+Per-tool retry attempts for transient failures. Default: `2`.
+- `XDBG_MCP_WAIT_POLL_MS=<int>`  
+Polling interval for `wait_until_running/stopped`. Default: `100`.
+- `XDBG_MCP_SKIP_PLUGIN_CHECK=1|0`  
+Skip startup checks for `x64dbg-automate.dp32/.dp64` and `libzmq`. Default: `0`.
+
+## Common Startup Errors
+
+1. `Missing x64dbg automate plugin dependencies`  
+Cause: plugin files not in debugger `plugins` dir.  
+Fix: copy `dp32/dp64/libzmq` to the exact folder shown in error text.
+2. `Failed to load executable`  
+Cause: target path/bitness mismatch, or invalid executable path.  
+Fix: verify `target_exe` exists; prefer `x96dbg.exe`; avoid non-ASCII path when possible.
+3. `Not connected to x64dbg`  
+Cause: no active session or stale session.  
+Fix: run `start_session` or `connect_session`; check `health`.
+
+## CTF Quick Flow
+
+用于常见 Reverse/CrackMe 题目的推荐调用顺序：
+
+1. 用 `start_session` 启动题目，传入 `target_exe=<challenge.exe>` 与 `xdbg_path=<x96dbg.exe>`。
+2. 用 `set_breakpoint` 在入口、比较分支、关键 API（`memcmp`、`lstrcmp*` 调用点）下断点。
+3. 用 `go` + `wait_until_stopped` 跑到关键逻辑位置。
+4. 用 `get_register` / `get_registers` 读取分支关键值（例如比较后的 `EAX`）。
+5. 用 `read_memory` 抓缓冲区或 key 的中间态，优先拿“程序真实期望值”。
+6. 用 `step_over` / `step_into` 收敛路径，逻辑确认后再用 `write_memory_hex` 做最小 patch。
+
+## CTF Guide
+
+- [CTF Reverse Workflow (zh-CN)](docs/CTF_RE_WORKFLOW_zh-CN.md)

@@ -1,0 +1,2 @@
+mcp>=1.26.0
+x64dbg_automate>=0.7.5

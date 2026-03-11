@@ -1,0 +1,2 @@
+[console_scripts]
+xdbg-mcp = xdbg_mcp.server:main

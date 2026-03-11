@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xdbg-mcp"
+version = "0.1.0"
+description = "MCP server for x64dbg/x96dbg automation."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.26.0",
+  "x64dbg_automate>=0.7.5",
+]
+
+[project.scripts]
+xdbg-mcp = "xdbg_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

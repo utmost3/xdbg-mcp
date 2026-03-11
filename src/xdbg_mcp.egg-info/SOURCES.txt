@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/xdbg_mcp/__init__.py
+src/xdbg_mcp/__main__.py
+src/xdbg_mcp/server.py
+src/xdbg_mcp.egg-info/PKG-INFO
+src/xdbg_mcp.egg-info/SOURCES.txt
+src/xdbg_mcp.egg-info/dependency_links.txt
+src/xdbg_mcp.egg-info/entry_points.txt
+src/xdbg_mcp.egg-info/requires.txt
+src/xdbg_mcp.egg-info/top_level.txt
