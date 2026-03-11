@@ -9,9 +9,10 @@
 - 寄存器与内存读写。
 - 软件断点、硬件断点、内存断点。
 - 任意地址反汇编与汇编。
+- 高阶调试工具：`run_to`（临时断点运行到目标）、`snapshot_context`（寄存器+当前指令+栈快照）。
 - 瞬时会话故障自动重连与重试。
 - 按位数自动选择调试器（`x96dbg` 会根据目标 PE 自动选择 `x32dbg/x64dbg`）。
-- 启动增强：插件依赖检查、非 ASCII 目标路径自动复制兜底。
+- 启动增强：多目录插件依赖检查、非 ASCII 目标路径自动复制兜底。
 
 ## 支持客户端
 
@@ -126,7 +127,8 @@ python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 1. `health`
 2. 调用 `start_session`，参数中传入 `target_exe=<your_challenge.exe>`
 3. `debugger_status`
-4. 在已知地址调用 `set_breakpoint`，然后执行 `go`
+4. 调用 `run_to` 跑到关键地址（或先 `set_breakpoint` 再 `go`）
+5. 调用 `snapshot_context` 检查当前寄存器与栈快照
 
 如果 `health.connected=true`，并且 `debugger_status` 返回有效的进程/调试器信息，说明部署完成。
 
@@ -139,7 +141,7 @@ python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 3. `python -m xdbg_mcp --xdbg-path <你的x96dbg.exe>` 能正常启动（不报插件缺失）。
 4. MCP 客户端可发现 `xdbg` server 并能调用 `health`。
 5. `start_session` 能成功打开目标程序。
-6. `debugger_status` 返回有效调试状态（非空进程/会话信息）。
+6. `debugger_status` 返回有效调试状态（非空进程/会话信息），`run_to/snapshot_context` 可正常返回结果。
 
 ## 稳定性环境变量
 
@@ -156,7 +158,7 @@ python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 
 1. `Missing x64dbg automate plugin dependencies`  
 原因：插件文件不在调试器 `plugins` 目录。  
-处理：把 `dp32/dp64/libzmq` 复制到报错提示的准确目录。
+处理：把 `dp32/dp64/libzmq` 复制到报错提示的准确目录。`xdbg-mcp` 会自动检查常见目录（`plugins`、`x32\plugins`、`x64\plugins`）。
 2. `Failed to load executable`  
 原因：目标路径无效、目标位数与调试器不匹配。  
 处理：确认 `target_exe` 存在；优先使用 `x96dbg.exe`；尽量避免非 ASCII 路径。
@@ -169,11 +171,10 @@ python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 用于常见 Reverse 题目的推荐调用顺序：
 
 1. 用 `start_session` 启动题目，传入 `target_exe=<challenge.exe>` 与 `xdbg_path=<x96dbg.exe>`。
-2. 用 `set_breakpoint` 在入口、比较分支、关键 API（`memcmp`、`lstrcmp*` 调用点）下断点。
-3. 用 `go` + `wait_until_stopped` 跑到关键逻辑位置。
-4. 用 `get_register` / `get_registers` 读取分支关键值（例如比较后的 `EAX`）。
-5. 用 `read_memory` 抓缓冲区或 key 的中间态，优先拿“程序真实期望值”。
-6. 用 `step_over` / `step_into` 收敛路径，逻辑确认后再用 `write_memory_hex` 做最小 patch。
+2. 用 `run_to` 直接跑到入口、比较分支、关键 API（`memcmp`、`lstrcmp*` 调用点）。
+3. 用 `snapshot_context` 一次读取寄存器、当前指令、栈快照。
+4. 需要更细粒度时再用 `get_register(s)` / `read_memory` / `step_over` / `step_into` 收敛路径。
+5. 逻辑确认后再用 `write_memory_hex` 做最小 patch。
 
 ## CTF 指南
 

@@ -36,7 +36,7 @@ python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 1. `health`
 2. `start_session`（或 `list_sessions` + `connect_session`）
 3. `debugger_status`
-4. `memory_map`
+4. `run_to`（关键地址）+ `snapshot_context`
 
 ## 4. CTF 标准做题流程（SOP）
 
@@ -63,10 +63,11 @@ python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
 推荐高频工具：
 
 1. 会话：`start_session` / `connect_session` / `terminate_session`
-2. 控制：`go` / `pause` / `step_over` / `wait_until_stopped`
+2. 控制：`run_to` / `go` / `pause` / `step_over` / `wait_until_stopped`
 3. 观察：`get_register` / `get_registers` / `read_memory` / `disassemble`
-4. 断点：`set_breakpoint` / `list_breakpoints` / `clear_breakpoint`
-5. 修改：`write_memory_hex` / `set_register`
+4. 快照：`snapshot_context`（寄存器 + 当前指令 + 栈）
+5. 断点：`set_breakpoint` / `list_breakpoints` / `clear_breakpoint`
+6. 修改：`write_memory_hex` / `set_register`
 
 实战建议：
 

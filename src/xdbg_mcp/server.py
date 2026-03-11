@@ -54,6 +54,7 @@ class ServerState:
     client: X64DbgClient | None = None
     xdbg_path: str = os.environ.get("XDBG_PATH", "x64dbg")
     resolved_xdbg_path: str = ""
+    resolved_plugin_dir: str = ""
     last_session_pid: int | None = None
     auto_reconnect: bool = _env_bool("XDBG_MCP_AUTO_RECONNECT", True)
     retry_attempts: int = _env_int("XDBG_MCP_RETRY_ATTEMPTS", 2)
@@ -314,28 +315,57 @@ def _resolve_debugger_path(path_hint: str, target_exe: str = "") -> str:
     return path_hint
 
 
-def _validate_plugin_dependencies(resolved_xdbg_path: str) -> None:
+def _validate_plugin_dependencies(resolved_xdbg_path: str) -> str:
     if STATE.skip_plugin_check:
-        return
+        return ""
 
     dbg_path = Path(resolved_xdbg_path)
     bitness = _debugger_bitness_from_name(dbg_path.name)
     if bitness is None:
-        return
+        return ""
     plugin_ext = ".dp64" if bitness == 64 else ".dp32"
-    plugin_dir = dbg_path.parent / "plugins"
-    required = [
-        plugin_dir / f"x64dbg-automate{plugin_ext}",
-        plugin_dir / "libzmq-mt-4_3_5.dll",
+    bitness_dir = "x64" if bitness == 64 else "x32"
+    candidates = [
+        dbg_path.parent / "plugins",
+        dbg_path.parent / bitness_dir / "plugins",
+        dbg_path.parent.parent / "plugins",
+        dbg_path.parent.parent / bitness_dir / "plugins",
     ]
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
-        missing_text = "\n".join(missing)
-        raise FileNotFoundError(
-            "Missing x64dbg automate plugin dependencies:\n"
-            f"{missing_text}\n"
-            "Install/copy the matching dp32/dp64 plugin and libzmq into the debugger plugins folder."
-        )
+    deduped_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(candidate).lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_candidates.append(candidate)
+
+    required_names = [
+        f"x64dbg-automate{plugin_ext}",
+        "libzmq-mt-4_3_5.dll",
+    ]
+    for plugin_dir in deduped_candidates:
+        if all((plugin_dir / file_name).is_file() for file_name in required_names):
+            return str(plugin_dir)
+
+    checked_dirs = "\n".join(f"- {path}" for path in deduped_candidates)
+    required_text = "\n".join(f"- {file_name}" for file_name in required_names)
+    raise FileNotFoundError(
+        "Missing x64dbg automate plugin dependencies.\n"
+        f"Required files:\n{required_text}\n"
+        f"Checked directories:\n{checked_dirs}"
+    )
+
+
+def _read_first_register(client: X64DbgClient, names: tuple[str, ...]) -> int:
+    for name in names:
+        try:
+            value = client.get_reg(name)
+            if isinstance(value, int):
+                return value
+        except Exception:
+            continue
+    raise RuntimeError(f"Cannot read any register from {', '.join(names)}")
 
 
 def _is_ascii_path(path: str) -> bool:
@@ -488,6 +518,7 @@ def health() -> dict[str, Any]:
             "connected": live_client is not None,
             "default_xdbg_path": STATE.xdbg_path,
             "resolved_xdbg_path": STATE.resolved_xdbg_path,
+            "resolved_plugin_dir": STATE.resolved_plugin_dir,
             "session_pid": _session_pid_of(live_client),
             "last_session_pid": STATE.last_session_pid,
             "auto_reconnect": STATE.auto_reconnect,
@@ -500,6 +531,7 @@ def configure_default_xdbg_path(xdbg_path: str) -> dict[str, Any]:
     """Set the default debugger path used by start/connect commands."""
     STATE.xdbg_path = xdbg_path.strip()
     STATE.resolved_xdbg_path = ""
+    STATE.resolved_plugin_dir = ""
     return _ok({"default_xdbg_path": STATE.xdbg_path})
 
 
@@ -521,21 +553,24 @@ def start_session(
     try:
         prepared_target, copied_path = _prepare_target_executable(target_exe)
         resolved = _resolve_debugger_path(path_hint, prepared_target)
-        _validate_plugin_dependencies(resolved)
+        plugin_dir = _validate_plugin_dependencies(resolved)
         client = X64DbgClient(resolved)
         debugger_pid = client.start_session(prepared_target, cmdline, current_dir)
         _set_client(client, resolved)
         STATE.xdbg_path = path_hint
+        STATE.resolved_plugin_dir = plugin_dir
         return _ok(
             {
                 "debugger_pid": debugger_pid,
                 "resolved_xdbg_path": resolved,
+                "resolved_plugin_dir": plugin_dir or None,
                 "prepared_target_exe": prepared_target or None,
                 "copied_target_exe": copied_path or None,
             }
         )
     except Exception as exc:
         _clear_client()
+        STATE.resolved_plugin_dir = ""
         return _error(exc)
 
 
@@ -561,14 +596,16 @@ def connect_session(session_pid: int | None = None, xdbg_path: str = "") -> dict
                 pid = sessions[0].pid
 
         resolved = _resolve_debugger_path(path_hint)
-        _validate_plugin_dependencies(resolved)
+        plugin_dir = _validate_plugin_dependencies(resolved)
         client = X64DbgClient(resolved)
         client.attach_session(pid)
         _set_client(client, resolved)
         STATE.xdbg_path = path_hint
-        return _ok({"session_pid": pid, "resolved_xdbg_path": resolved})
+        STATE.resolved_plugin_dir = plugin_dir
+        return _ok({"session_pid": pid, "resolved_xdbg_path": resolved, "resolved_plugin_dir": plugin_dir or None})
     except Exception as exc:
         _clear_client()
+        STATE.resolved_plugin_dir = ""
         return _error(exc)
 
 
@@ -578,6 +615,7 @@ def connect_remote(host: str, req_rep_port: int, pub_sub_port: int) -> dict[str,
     try:
         remote_client = X64DbgClient.connect_remote(host, req_rep_port, pub_sub_port)
         _set_client(remote_client, "")
+        STATE.resolved_plugin_dir = ""
         return _ok({"host": host, "req_rep_port": req_rep_port, "pub_sub_port": pub_sub_port})
     except Exception as exc:
         _clear_client()
@@ -699,6 +737,44 @@ def step_over(step_count: int = 1) -> dict[str, Any]:
 
 
 @mcp.tool()
+def run_to(address_or_symbol: int | str, timeout: int = 10, clear_on_timeout: bool = True) -> dict[str, Any]:
+    """Run until address/symbol is reached via a temporary software breakpoint."""
+    parsed = _parse_address_or_symbol(address_or_symbol)
+    if parsed is None:
+        return _error(ValueError("address_or_symbol is required"))
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        client.set_breakpoint(
+            parsed,
+            bp_type=StandardBreakpointType.SingleShotInt3,
+            singleshoot=True,
+        )
+        client.go()
+        reached = _wait_for_running_state(expect_running=False, timeout=timeout)
+        if not reached and clear_on_timeout:
+            try:
+                client.clear_breakpoint(parsed)
+            except Exception:
+                pass
+
+        payload: dict[str, Any] = {
+            "target": parsed,
+            "reached": reached,
+        }
+        if reached:
+            ip = _read_first_register(client, ("cip", "rip", "eip"))
+            payload["instruction_pointer"] = f"0x{ip:X}"
+            try:
+                payload["instruction"] = client.disassemble_at(ip)
+            except Exception:
+                payload["instruction"] = None
+        return payload
+
+    return _run(action)
+
+
+@mcp.tool()
 def wait_until_stopped(timeout: int = 10) -> dict[str, Any]:
     """Wait until target stops (breakpoint, pause, exception, etc.)."""
     return _run(lambda: _wait_for_running_state(expect_running=False, timeout=timeout))
@@ -731,6 +807,52 @@ def _wait_for_running_state(expect_running: bool, timeout: int) -> bool:
 def get_registers() -> dict[str, Any]:
     """Get register snapshot."""
     return _run(lambda: _require_client().get_regs())
+
+
+@mcp.tool()
+def snapshot_context(
+    include_stack: bool = True,
+    stack_size: int = 128,
+    stack_mode: str = "hexdump",
+) -> dict[str, Any]:
+    """Read registers + current instruction + optional stack snapshot in one call."""
+    safe_stack_size = _validate_rw_size(stack_size) if include_stack else 0
+    selected_mode = stack_mode.strip().lower()
+    if selected_mode not in ("hex", "utf8", "hexdump"):
+        return _error(ValueError("stack_mode must be one of: hex, utf8, hexdump"))
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        ip = _read_first_register(client, ("cip", "rip", "eip"))
+        sp = _read_first_register(client, ("csp", "rsp", "esp"))
+        payload: dict[str, Any] = {
+            "instruction_pointer": f"0x{ip:X}",
+            "stack_pointer": f"0x{sp:X}",
+            "registers": client.get_regs(),
+        }
+        try:
+            payload["instruction"] = client.disassemble_at(ip)
+        except Exception:
+            payload["instruction"] = None
+
+        if include_stack:
+            stack_data = client.read_memory(sp, safe_stack_size)
+            stack_payload: dict[str, Any] = {
+                "address": f"0x{sp:X}",
+                "size": len(stack_data),
+                "mode": selected_mode,
+            }
+            if selected_mode == "hex":
+                stack_payload["data"] = stack_data.hex()
+            elif selected_mode == "utf8":
+                stack_payload["data"] = stack_data.decode("utf-8", errors="replace")
+            else:
+                stack_payload["data"] = _hexdump(stack_data, sp)
+            payload["stack"] = stack_payload
+
+        return payload
+
+    return _run(action)
 
 
 @mcp.tool()
