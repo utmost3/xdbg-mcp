@@ -14,6 +14,7 @@ from typing import Any, Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 from x64dbg_automate import X64DbgClient
+from x64dbg_automate.events import DbgEvent, EventType
 from x64dbg_automate.models import (
     BreakpointType,
     HardwareBreakpointType,
@@ -29,6 +30,34 @@ TRANSIENT_ERROR_MARKERS = (
     "operation cannot be accomplished in current state",
     "not connected to x64dbg",
     "session did not appear in a reasonable amount of time",
+)
+CORE_REGISTER_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ip", ("cip", "rip", "eip")),
+    ("sp", ("csp", "rsp", "esp")),
+    ("ax", ("rax", "eax")),
+    ("bx", ("rbx", "ebx")),
+    ("cx", ("rcx", "ecx")),
+    ("dx", ("rdx", "edx")),
+    ("si", ("rsi", "esi")),
+    ("di", ("rdi", "edi")),
+    ("bp", ("rbp", "ebp")),
+    ("r8", ("r8",)),
+    ("r9", ("r9",)),
+    ("r10", ("r10",)),
+    ("r11", ("r11",)),
+    ("r12", ("r12",)),
+    ("r13", ("r13",)),
+    ("r14", ("r14",)),
+    ("r15", ("r15",)),
+)
+STOP_RELEVANT_EVENT_TYPES: tuple[EventType, ...] = (
+    EventType.EVENT_BREAKPOINT,
+    EventType.EVENT_SYSTEMBREAKPOINT,
+    EventType.EVENT_EXCEPTION,
+    EventType.EVENT_PAUSE_DEBUG,
+    EventType.EVENT_STEPPED,
+    EventType.EVENT_STOP_DEBUG,
+    EventType.EVENT_EXIT_PROCESS,
 )
 
 
@@ -49,6 +78,28 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+@dataclass(frozen=True)
+class SoftwareBreakpointSpec:
+    target: int | str
+    kind: StandardBreakpointType
+    name: str | None
+    singleshot: bool
+
+
+@dataclass(frozen=True)
+class HardwareBreakpointSpec:
+    target: int | str
+    kind: HardwareBreakpointType
+    size: int
+
+
+@dataclass(frozen=True)
+class MemoryBreakpointSpec:
+    target: int | str
+    kind: MemoryBreakpointType
+    singleshot: bool
+
+
 @dataclass
 class ServerState:
     client: X64DbgClient | None = None
@@ -60,6 +111,12 @@ class ServerState:
     retry_attempts: int = _env_int("XDBG_MCP_RETRY_ATTEMPTS", 2)
     wait_poll_ms: int = _env_int("XDBG_MCP_WAIT_POLL_MS", 100)
     skip_plugin_check: bool = _env_bool("XDBG_MCP_SKIP_PLUGIN_CHECK", False)
+    event_drain_limit: int = _env_int("XDBG_MCP_EVENT_DRAIN_LIMIT", 64)
+    software_breakpoints: list[SoftwareBreakpointSpec] = dataclasses.field(default_factory=list)
+    hardware_breakpoints: list[HardwareBreakpointSpec] = dataclasses.field(default_factory=list)
+    memory_breakpoints: list[MemoryBreakpointSpec] = dataclasses.field(default_factory=list)
+    reconnect_count: int = 0
+    last_reconnect_time: float | None = None
 
 
 STATE = ServerState()
@@ -137,6 +194,205 @@ def _clear_client() -> None:
     STATE.client = None
 
 
+def _target_key(value: int | str) -> str:
+    if isinstance(value, int):
+        return f"int:{value}"
+    return f"str:{value.strip().lower()}"
+
+
+def _remember_software_breakpoint(spec: SoftwareBreakpointSpec) -> None:
+    key = _target_key(spec.target)
+    for index, existing in enumerate(STATE.software_breakpoints):
+        if _target_key(existing.target) == key and existing.kind == spec.kind:
+            STATE.software_breakpoints[index] = spec
+            return
+    STATE.software_breakpoints.append(spec)
+
+
+def _remember_hardware_breakpoint(spec: HardwareBreakpointSpec) -> None:
+    key = _target_key(spec.target)
+    for index, existing in enumerate(STATE.hardware_breakpoints):
+        if (
+            _target_key(existing.target) == key
+            and existing.kind == spec.kind
+            and existing.size == spec.size
+        ):
+            STATE.hardware_breakpoints[index] = spec
+            return
+    STATE.hardware_breakpoints.append(spec)
+
+
+def _remember_memory_breakpoint(spec: MemoryBreakpointSpec) -> None:
+    key = _target_key(spec.target)
+    for index, existing in enumerate(STATE.memory_breakpoints):
+        if _target_key(existing.target) == key and existing.kind == spec.kind:
+            STATE.memory_breakpoints[index] = spec
+            return
+    STATE.memory_breakpoints.append(spec)
+
+
+def _forget_software_breakpoint(target: int | str | None) -> None:
+    if target is None:
+        STATE.software_breakpoints.clear()
+        return
+    key = _target_key(target)
+    STATE.software_breakpoints = [
+        spec for spec in STATE.software_breakpoints if _target_key(spec.target) != key
+    ]
+
+
+def _forget_hardware_breakpoint(target: int | str | None) -> None:
+    if target is None:
+        STATE.hardware_breakpoints.clear()
+        return
+    key = _target_key(target)
+    STATE.hardware_breakpoints = [
+        spec for spec in STATE.hardware_breakpoints if _target_key(spec.target) != key
+    ]
+
+
+def _forget_memory_breakpoint(target: int | str | None) -> None:
+    if target is None:
+        STATE.memory_breakpoints.clear()
+        return
+    key = _target_key(target)
+    STATE.memory_breakpoints = [
+        spec for spec in STATE.memory_breakpoints if _target_key(spec.target) != key
+    ]
+
+
+def _reapply_recorded_breakpoints(client: X64DbgClient) -> dict[str, Any]:
+    restored = {"software": 0, "hardware": 0, "memory": 0, "errors": []}
+
+    for spec in STATE.software_breakpoints:
+        try:
+            client.set_breakpoint(
+                spec.target,
+                name=spec.name,
+                bp_type=spec.kind,
+                singleshoot=spec.singleshot,
+            )
+            restored["software"] += 1
+        except Exception as exc:
+            restored["errors"].append(
+                {
+                    "type": "software",
+                    "target": spec.target,
+                    "error": str(exc),
+                }
+            )
+
+    for spec in STATE.hardware_breakpoints:
+        try:
+            client.set_hardware_breakpoint(
+                spec.target,
+                bp_type=spec.kind,
+                size=spec.size,
+            )
+            restored["hardware"] += 1
+        except Exception as exc:
+            restored["errors"].append(
+                {
+                    "type": "hardware",
+                    "target": spec.target,
+                    "error": str(exc),
+                }
+            )
+
+    for spec in STATE.memory_breakpoints:
+        try:
+            client.set_memory_breakpoint(
+                spec.target,
+                bp_type=spec.kind,
+                singleshoot=spec.singleshot,
+            )
+            restored["memory"] += 1
+        except Exception as exc:
+            restored["errors"].append(
+                {
+                    "type": "memory",
+                    "target": spec.target,
+                    "error": str(exc),
+                }
+            )
+
+    return restored
+
+
+def _event_to_payload(event: DbgEvent) -> dict[str, Any]:
+    payload: dict[str, Any] = {"event_type": str(event.event_type)}
+    event_data = getattr(event, "event_data", None)
+    if event_data is not None and hasattr(event_data, "model_dump"):
+        payload["event_data"] = _to_jsonable(event_data.model_dump())
+    else:
+        payload["event_data"] = None
+    return payload
+
+
+def _drain_debug_events(client: X64DbgClient, max_events: int | None = None) -> list[DbgEvent]:
+    limit = max_events or STATE.event_drain_limit
+    safe_limit = max(1, int(limit))
+    drained: list[DbgEvent] = []
+    for _ in range(safe_limit):
+        event = client.get_latest_debug_event()
+        if event is None:
+            break
+        drained.append(event)
+    drained.reverse()
+    return drained
+
+
+def _derive_stop_reason(events: list[DbgEvent]) -> tuple[str, dict[str, Any] | None]:
+    for event in reversed(events):
+        if event.event_type not in STOP_RELEVANT_EVENT_TYPES:
+            continue
+        payload = _event_to_payload(event)
+        if event.event_type in (EventType.EVENT_BREAKPOINT, EventType.EVENT_SYSTEMBREAKPOINT):
+            return "breakpoint", payload
+        if event.event_type == EventType.EVENT_EXCEPTION:
+            return "exception", payload
+        if event.event_type == EventType.EVENT_PAUSE_DEBUG:
+            return "paused", payload
+        if event.event_type == EventType.EVENT_STEPPED:
+            return "stepped", payload
+        if event.event_type == EventType.EVENT_EXIT_PROCESS:
+            return "process_exit", payload
+        if event.event_type == EventType.EVENT_STOP_DEBUG:
+            return "debug_stopped", payload
+        return str(event.event_type).lower(), payload
+    return "unknown", None
+
+
+def _collect_stop_details(
+    client: X64DbgClient,
+    *,
+    include_events: bool,
+    max_events: int | None = None,
+) -> dict[str, Any]:
+    events = _drain_debug_events(client, max_events=max_events)
+    stop_reason, stop_event = _derive_stop_reason(events)
+    payload: dict[str, Any] = {
+        "stop_reason": stop_reason,
+        "stop_event": stop_event,
+    }
+    if include_events:
+        payload["events"] = [_event_to_payload(item) for item in events]
+    return payload
+
+
+def _set_first_register(client: X64DbgClient, names: tuple[str, ...], value: int) -> str:
+    last_error: Exception | None = None
+    for name in names:
+        try:
+            if client.set_reg(name, value):
+                return name
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(f"Cannot set register {names}: {last_error}")
+    raise RuntimeError(f"Cannot set register {names}")
+
+
 def _is_client_alive(client: X64DbgClient | None) -> bool:
     if client is None:
         return False
@@ -194,6 +450,9 @@ def _reconnect_client() -> bool:
         client = X64DbgClient(resolved)
         client.attach_session(chosen_pid)
         _set_client(client, resolved)
+        _reapply_recorded_breakpoints(client)
+        STATE.reconnect_count += 1
+        STATE.last_reconnect_time = time.time()
         return True
     except Exception:
         return False
@@ -368,6 +627,73 @@ def _read_first_register(client: X64DbgClient, names: tuple[str, ...]) -> int:
     raise RuntimeError(f"Cannot read any register from {', '.join(names)}")
 
 
+def _capture_core_registers(client: X64DbgClient) -> dict[str, int]:
+    snapshot: dict[str, int] = {}
+    for logical_name, aliases in CORE_REGISTER_ALIASES:
+        try:
+            snapshot[logical_name] = _read_first_register(client, aliases)
+        except Exception:
+            continue
+    return snapshot
+
+
+def _diff_register_snapshots(before: dict[str, int], after: dict[str, int]) -> dict[str, Any]:
+    changed: dict[str, Any] = {}
+    for key in sorted(set(before) | set(after)):
+        old_value = before.get(key)
+        new_value = after.get(key)
+        if old_value == new_value:
+            continue
+        changed[key] = {
+            "before": old_value,
+            "after": new_value,
+            "before_hex": f"0x{old_value:X}" if isinstance(old_value, int) else None,
+            "after_hex": f"0x{new_value:X}" if isinstance(new_value, int) else None,
+        }
+    return changed
+
+
+def _parse_step_mode(mode: str) -> str:
+    selected = mode.strip().lower()
+    if selected not in ("into", "over"):
+        raise ValueError("mode must be one of: into, over")
+    return selected
+
+
+def _parse_pattern_bytes(pattern: str, pattern_type: str) -> tuple[bytes, str]:
+    text = pattern.strip()
+    if not text:
+        raise ValueError("pattern is empty")
+    selected = pattern_type.strip().lower()
+    if selected == "hex":
+        return _normalize_hex_blob(text), selected
+    if selected == "ascii":
+        return text.encode("utf-8"), selected
+    if selected == "utf16le":
+        return text.encode("utf-16le"), selected
+    raise ValueError("pattern_type must be one of: hex, ascii, utf16le")
+
+
+def _encode_text_bytes(text: str, encoding: str, append_null: bool) -> tuple[bytes, str]:
+    selected = encoding.strip().lower()
+    if selected in ("utf8", "utf-8"):
+        data = text.encode("utf-8")
+        if append_null:
+            data += b"\x00"
+        return data, "utf-8"
+    if selected in ("ascii",):
+        data = text.encode("ascii")
+        if append_null:
+            data += b"\x00"
+        return data, "ascii"
+    if selected in ("utf16le", "utf-16le"):
+        data = text.encode("utf-16le")
+        if append_null:
+            data += b"\x00\x00"
+        return data, "utf-16le"
+    raise ValueError("encoding must be one of: ascii, utf-8, utf-16le")
+
+
 def _is_ascii_path(path: str) -> bool:
     try:
         path.encode("ascii")
@@ -477,6 +803,15 @@ def _parse_bp_list_kind(kind: str) -> BreakpointType:
     return lut[key]
 
 
+def _parse_event_type(name: str) -> EventType:
+    normalized = name.strip().upper()
+    try:
+        return EventType(normalized)
+    except Exception as exc:
+        supported = ", ".join(item.value for item in EventType)
+        raise ValueError(f"event_type must be one of: {supported}") from exc
+
+
 def _hexdump(data: bytes, base_address: int) -> str:
     lines: list[str] = []
     for offset in range(0, len(data), 16):
@@ -522,6 +857,13 @@ def health() -> dict[str, Any]:
             "session_pid": _session_pid_of(live_client),
             "last_session_pid": STATE.last_session_pid,
             "auto_reconnect": STATE.auto_reconnect,
+            "reconnect_count": STATE.reconnect_count,
+            "last_reconnect_time": STATE.last_reconnect_time,
+            "tracked_breakpoints": {
+                "software": len(STATE.software_breakpoints),
+                "hardware": len(STATE.hardware_breakpoints),
+                "memory": len(STATE.memory_breakpoints),
+            },
         }
     )
 
@@ -557,6 +899,9 @@ def start_session(
         client = X64DbgClient(resolved)
         debugger_pid = client.start_session(prepared_target, cmdline, current_dir)
         _set_client(client, resolved)
+        STATE.software_breakpoints.clear()
+        STATE.hardware_breakpoints.clear()
+        STATE.memory_breakpoints.clear()
         STATE.xdbg_path = path_hint
         STATE.resolved_plugin_dir = plugin_dir
         return _ok(
@@ -600,6 +945,9 @@ def connect_session(session_pid: int | None = None, xdbg_path: str = "") -> dict
         client = X64DbgClient(resolved)
         client.attach_session(pid)
         _set_client(client, resolved)
+        STATE.software_breakpoints.clear()
+        STATE.hardware_breakpoints.clear()
+        STATE.memory_breakpoints.clear()
         STATE.xdbg_path = path_hint
         STATE.resolved_plugin_dir = plugin_dir
         return _ok({"session_pid": pid, "resolved_xdbg_path": resolved, "resolved_plugin_dir": plugin_dir or None})
@@ -615,6 +963,9 @@ def connect_remote(host: str, req_rep_port: int, pub_sub_port: int) -> dict[str,
     try:
         remote_client = X64DbgClient.connect_remote(host, req_rep_port, pub_sub_port)
         _set_client(remote_client, "")
+        STATE.software_breakpoints.clear()
+        STATE.hardware_breakpoints.clear()
+        STATE.memory_breakpoints.clear()
         STATE.resolved_plugin_dir = ""
         return _ok({"host": host, "req_rep_port": req_rep_port, "pub_sub_port": pub_sub_port})
     except Exception as exc:
@@ -644,6 +995,9 @@ def _terminate_session_impl() -> str:
     client = _require_client()
     client.terminate_session()
     _clear_client()
+    STATE.software_breakpoints.clear()
+    STATE.hardware_breakpoints.clear()
+    STATE.memory_breakpoints.clear()
     return "terminated"
 
 
@@ -737,6 +1091,131 @@ def step_over(step_count: int = 1) -> dict[str, Any]:
 
 
 @mcp.tool()
+def step_trace(step_count: int = 16, mode: str = "into", include_register_diff: bool = True) -> dict[str, Any]:
+    """Trace N steps with instruction pointer/instruction and optional register diffs."""
+    safe_steps = max(1, min(int(step_count), 4096))
+    selected_mode = _parse_step_mode(mode)
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        trace: list[dict[str, Any]] = []
+        previous_regs = _capture_core_registers(client) if include_register_diff else {}
+        for index in range(safe_steps):
+            if selected_mode == "into":
+                stepped = client.stepi(step_count=1)
+            else:
+                stepped = client.stepo(step_count=1)
+
+            ip = _read_first_register(client, ("cip", "rip", "eip"))
+            step_payload: dict[str, Any] = {
+                "index": index + 1,
+                "stepped": bool(stepped),
+                "instruction_pointer": f"0x{ip:X}",
+            }
+            try:
+                step_payload["instruction"] = client.disassemble_at(ip)
+            except Exception:
+                step_payload["instruction"] = None
+
+            if include_register_diff:
+                current_regs = _capture_core_registers(client)
+                step_payload["changed_registers"] = _diff_register_snapshots(previous_regs, current_regs)
+                previous_regs = current_regs
+
+            trace.append(step_payload)
+            if not stepped:
+                break
+
+        return {
+            "mode": selected_mode,
+            "requested_steps": safe_steps,
+            "actual_steps": len(trace),
+            "trace": trace,
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
+def run_until_expr(
+    expression: str,
+    timeout: int = 30,
+    max_stops: int = 50,
+    pass_exceptions: bool = False,
+    swallow_exceptions: bool = False,
+    pause_on_timeout: bool = True,
+) -> dict[str, Any]:
+    """Run until expression evaluates to non-zero, or timeout/stop limit is reached."""
+    expr = expression.strip()
+    if not expr:
+        return _error(ValueError("expression is empty"))
+    if pass_exceptions and swallow_exceptions:
+        return _error(ValueError("Cannot pass and swallow exceptions at the same time"))
+    safe_timeout = max(1, int(timeout))
+    safe_max_stops = max(1, int(max_stops))
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        deadline = time.monotonic() + float(safe_timeout)
+        stops = 0
+        last_value = 0
+        last_success = False
+        reached = False
+
+        while time.monotonic() < deadline:
+            last_value, last_success = client.eval_sync(expr)
+            if last_success and last_value != 0:
+                reached = True
+                break
+
+            if stops >= safe_max_stops:
+                break
+
+            if not client.is_running():
+                client.go(
+                    pass_exceptions=pass_exceptions,
+                    swallow_exceptions=swallow_exceptions,
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_result = _wait_for_running_state(
+                expect_running=False,
+                timeout=max(1, int(remaining)),
+                clear_stale_events=False,
+                include_events=False,
+            )
+            if not bool(wait_result.get("matched")):
+                if pause_on_timeout:
+                    try:
+                        client.pause()
+                    except Exception:
+                        pass
+                break
+            stops += 1
+
+        payload: dict[str, Any] = {
+            "expression": expr,
+            "reached": reached,
+            "stops": stops,
+            "max_stops": safe_max_stops,
+            "timeout": safe_timeout,
+            "last_value": last_value,
+            "last_success": last_success,
+            "timed_out": (not reached) and (time.monotonic() >= deadline),
+        }
+        try:
+            ip = _read_first_register(client, ("cip", "rip", "eip"))
+            payload["instruction_pointer"] = f"0x{ip:X}"
+            payload["instruction"] = client.disassemble_at(ip)
+        except Exception:
+            payload["instruction"] = None
+        return payload
+
+    return _run(action)
+
+
+@mcp.tool()
 def run_to(address_or_symbol: int | str, timeout: int = 10, clear_on_timeout: bool = True) -> dict[str, Any]:
     """Run until address/symbol is reached via a temporary software breakpoint."""
     parsed = _parse_address_or_symbol(address_or_symbol)
@@ -745,48 +1224,125 @@ def run_to(address_or_symbol: int | str, timeout: int = 10, clear_on_timeout: bo
 
     def action() -> dict[str, Any]:
         client = _require_client()
+        target_address = _try_resolve_address(parsed)
+        try:
+            client.clear_debug_events()
+        except Exception:
+            pass
         client.set_breakpoint(
             parsed,
             bp_type=StandardBreakpointType.SingleShotInt3,
             singleshoot=True,
         )
         client.go()
-        reached = _wait_for_running_state(expect_running=False, timeout=timeout)
-        if not reached and clear_on_timeout:
+        wait_result = _wait_for_running_state(
+            expect_running=False,
+            timeout=timeout,
+            clear_stale_events=False,
+            include_events=True,
+        )
+        stopped = bool(wait_result.get("matched"))
+        ip_value = wait_result.get("instruction_pointer_value")
+        reached = False
+        if stopped and target_address is not None and isinstance(ip_value, int):
+            reached = ip_value == target_address
+        if not reached and stopped and target_address is not None:
+            stop_event = wait_result.get("stop_event")
+            if isinstance(stop_event, dict):
+                event_data = stop_event.get("event_data")
+                if isinstance(event_data, dict):
+                    stop_addr = event_data.get("addr")
+                    if isinstance(stop_addr, int):
+                        reached = stop_addr == target_address
+
+        temporary_breakpoint_cleared = False
+        if bool(wait_result.get("timed_out")) and clear_on_timeout:
             try:
-                client.clear_breakpoint(parsed)
+                temporary_breakpoint_cleared = bool(client.clear_breakpoint(parsed))
             except Exception:
-                pass
+                temporary_breakpoint_cleared = False
 
         payload: dict[str, Any] = {
             "target": parsed,
+            "target_address": f"0x{target_address:X}" if isinstance(target_address, int) else None,
             "reached": reached,
+            "temporary_breakpoint_cleared": temporary_breakpoint_cleared,
         }
-        if reached:
-            ip = _read_first_register(client, ("cip", "rip", "eip"))
-            payload["instruction_pointer"] = f"0x{ip:X}"
-            try:
-                payload["instruction"] = client.disassemble_at(ip)
-            except Exception:
-                payload["instruction"] = None
+        payload.update(wait_result)
         return payload
 
     return _run(action)
 
 
 @mcp.tool()
-def wait_until_stopped(timeout: int = 10) -> dict[str, Any]:
+def wait_until_stopped(
+    timeout: int = 10,
+    detailed: bool = False,
+    include_events: bool = True,
+    clear_stale_events: bool = False,
+    pause_on_timeout: bool = False,
+) -> dict[str, Any]:
     """Wait until target stops (breakpoint, pause, exception, etc.)."""
-    return _run(lambda: _wait_for_running_state(expect_running=False, timeout=timeout))
+    def action() -> bool | dict[str, Any]:
+        result = _wait_for_running_state(
+            expect_running=False,
+            timeout=timeout,
+            clear_stale_events=clear_stale_events,
+            include_events=include_events,
+            pause_on_timeout=pause_on_timeout,
+        )
+        if detailed:
+            return result
+        return bool(result.get("matched"))
+
+    return _run(action)
 
 
 @mcp.tool()
-def wait_until_running(timeout: int = 10) -> dict[str, Any]:
+def wait_until_running(timeout: int = 10, detailed: bool = False) -> dict[str, Any]:
     """Wait until target enters running state."""
-    return _run(lambda: _wait_for_running_state(expect_running=True, timeout=timeout))
+    def action() -> bool | dict[str, Any]:
+        result = _wait_for_running_state(
+            expect_running=True,
+            timeout=timeout,
+            clear_stale_events=False,
+            include_events=False,
+        )
+        if detailed:
+            return result
+        return bool(result.get("matched"))
+
+    return _run(action)
 
 
-def _wait_for_running_state(expect_running: bool, timeout: int) -> bool:
+def _try_resolve_address(value: int | str) -> int | None:
+    if isinstance(value, int):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return _parse_int(text, allow_expression=True)
+    except Exception:
+        return None
+
+
+def _wait_for_running_state(
+    expect_running: bool,
+    timeout: int,
+    *,
+    clear_stale_events: bool,
+    include_events: bool,
+    pause_on_timeout: bool = False,
+) -> dict[str, Any]:
+    client = _require_client()
+    if clear_stale_events and not expect_running:
+        try:
+            client.clear_debug_events()
+        except Exception:
+            pass
+
+    start = time.monotonic()
     deadline = time.monotonic() + max(0.1, float(timeout))
     sleep_interval = max(0.01, STATE.wait_poll_ms / 1000.0)
     while time.monotonic() < deadline:
@@ -798,9 +1354,66 @@ def _wait_for_running_state(expect_running: bool, timeout: int) -> bool:
                 continue
             raise
         if running == expect_running:
-            return True
+            payload: dict[str, Any] = {
+                "matched": True,
+                "timed_out": False,
+                "expected_running": expect_running,
+                "is_running": running,
+                "elapsed_ms": int((time.monotonic() - start) * 1000),
+            }
+            if not expect_running:
+                payload.update(
+                    _collect_stop_details(
+                        _require_client(),
+                        include_events=include_events,
+                    )
+                )
+                try:
+                    ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+                    payload["instruction_pointer"] = f"0x{ip:X}"
+                    payload["instruction_pointer_value"] = ip
+                    payload["instruction"] = _require_client().disassemble_at(ip)
+                except Exception:
+                    payload["instruction"] = None
+            return payload
         time.sleep(sleep_interval)
-    return False
+
+    forced_pause = False
+    if pause_on_timeout and not expect_running:
+        try:
+            forced_pause = bool(_require_client().pause())
+        except Exception:
+            forced_pause = False
+
+    try:
+        final_running = bool(_require_client().is_running())
+    except Exception:
+        final_running = True
+
+    matched = final_running == expect_running
+    payload = {
+        "matched": matched,
+        "timed_out": not matched,
+        "expected_running": expect_running,
+        "is_running": final_running,
+        "elapsed_ms": int((time.monotonic() - start) * 1000),
+        "forced_pause": forced_pause,
+    }
+    if not expect_running:
+        payload.update(
+            _collect_stop_details(
+                _require_client(),
+                include_events=include_events,
+            )
+        )
+        try:
+            ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+            payload["instruction_pointer"] = f"0x{ip:X}"
+            payload["instruction_pointer_value"] = ip
+            payload["instruction"] = _require_client().disassemble_at(ip)
+        except Exception:
+            payload["instruction"] = None
+    return payload
 
 
 @mcp.tool()
@@ -899,6 +1512,225 @@ def read_memory(address: int | str, size: int, mode: str = "hex") -> dict[str, A
 
 
 @mcp.tool()
+def get_latest_event(pop: bool = True) -> dict[str, Any]:
+    """Get the latest debug event from x64dbg's event queue."""
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        event = client.get_latest_debug_event() if pop else client.peek_latest_debug_event()
+        if event is None:
+            return {"event": None}
+        return {"event": _event_to_payload(event), "popped": bool(pop)}
+
+    return _run(action)
+
+
+@mcp.tool()
+def drain_events(max_events: int = 32, clear_before: bool = False) -> dict[str, Any]:
+    """Drain recent debug events from queue for post-stop diagnosis."""
+    safe_limit = max(1, min(int(max_events), 512))
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        if clear_before:
+            client.clear_debug_events()
+            return {"events": [], "drained": 0, "cleared_before": True}
+
+        events = _drain_debug_events(client, max_events=safe_limit)
+        return {
+            "events": [_event_to_payload(item) for item in events],
+            "drained": len(events),
+            "max_events": safe_limit,
+            "cleared_before": False,
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
+def wait_for_event(event_type: str, timeout: int = 5) -> dict[str, Any]:
+    """Wait for a specific debug event type (e.g. EVENT_BREAKPOINT)."""
+    parsed_type = _parse_event_type(event_type)
+    safe_timeout = max(1, int(timeout))
+
+    def action() -> dict[str, Any]:
+        event = _require_client().wait_for_debug_event(parsed_type, timeout=safe_timeout)
+        return {
+            "event_type": parsed_type.value,
+            "timeout": safe_timeout,
+            "received": event is not None,
+            "event": _event_to_payload(event) if event is not None else None,
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
+def write_text_memory(
+    address: int | str,
+    text: str,
+    encoding: str = "utf-8",
+    append_null: bool = False,
+) -> dict[str, Any]:
+    """Write text bytes to memory (supports ascii/utf-8/utf-16le)."""
+    parsed_address = _parse_int(address, allow_expression=True)
+    data, normalized_encoding = _encode_text_bytes(text, encoding, append_null)
+    _validate_rw_size(len(data))
+
+    def action() -> dict[str, Any]:
+        updated = _require_client().write_memory(parsed_address, data)
+        return {
+            "address": f"0x{parsed_address:X}",
+            "updated": updated,
+            "written_size": len(data),
+            "encoding": normalized_encoding,
+            "append_null": append_null,
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
+def inject_string_and_continue(
+    buffer_address: int | str,
+    text: str,
+    continue_at: int | str,
+    encoding: str = "ascii",
+    append_null: bool = True,
+) -> dict[str, Any]:
+    """Write string to memory and set IP to continue address (useful for scanf/read bypass)."""
+    parsed_buffer = _parse_int(buffer_address, allow_expression=True)
+    parsed_continue = _parse_int(continue_at, allow_expression=True)
+    data, normalized_encoding = _encode_text_bytes(text, encoding, append_null)
+    _validate_rw_size(len(data))
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        old_ip = _read_first_register(client, ("cip", "rip", "eip"))
+        write_ok = client.write_memory(parsed_buffer, data)
+        ip_register = _set_first_register(client, ("cip", "rip", "eip"), parsed_continue)
+        return {
+            "buffer_address": f"0x{parsed_buffer:X}",
+            "continue_at": f"0x{parsed_continue:X}",
+            "write_ok": write_ok,
+            "written_size": len(data),
+            "encoding": normalized_encoding,
+            "append_null": append_null,
+            "previous_ip": f"0x{old_ip:X}",
+            "ip_register": ip_register,
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
+def find_memory_pattern(
+    pattern: str,
+    pattern_type: str = "hex",
+    max_hits: int = 32,
+    max_pages: int = 256,
+    module_filter: str = "",
+    case_insensitive: bool = False,
+    scan_chunk_size: int = 0x4000,
+    max_page_scan_size: int = 0x200000,
+) -> dict[str, Any]:
+    """Scan memory pages for a hex/ascii/utf16le pattern."""
+    needle, selected_type = _parse_pattern_bytes(pattern, pattern_type)
+    if case_insensitive and selected_type != "ascii":
+        return _error(ValueError("case_insensitive is only supported for pattern_type=ascii"))
+
+    safe_max_hits = max(1, int(max_hits))
+    safe_max_pages = max(1, int(max_pages))
+    safe_chunk_size = max(1, min(int(scan_chunk_size), MAX_MEMORY_RW))
+    safe_max_page_scan_size = max(1, int(max_page_scan_size))
+    module_filter_text = module_filter.strip().lower()
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        pages = client.memmap()[:safe_max_pages]
+        hits: list[dict[str, Any]] = []
+        seen_hits: set[int] = set()
+        scanned_pages = 0
+        scanned_bytes = 0
+        unreadable_pages = 0
+        skipped_pages = 0
+        needle_len = len(needle)
+        match_needle = needle.lower() if case_insensitive else needle
+
+        for page in pages:
+            if len(hits) >= safe_max_hits:
+                break
+            page_base = int(getattr(page, "base_address", 0))
+            page_size = int(getattr(page, "region_size", 0))
+            page_info = str(getattr(page, "info", ""))
+            if page_size <= 0:
+                skipped_pages += 1
+                continue
+            if module_filter_text and module_filter_text not in page_info.lower():
+                skipped_pages += 1
+                continue
+
+            scanned_pages += 1
+            scan_limit = min(page_size, safe_max_page_scan_size)
+            offset = 0
+            overlap = max(0, needle_len - 1)
+            tail = b""
+
+            while offset < scan_limit and len(hits) < safe_max_hits:
+                read_size = min(safe_chunk_size, scan_limit - offset)
+                read_address = page_base + offset
+                try:
+                    chunk = client.read_memory(read_address, read_size)
+                except Exception:
+                    unreadable_pages += 1
+                    break
+                if not chunk:
+                    break
+
+                scanned_bytes += len(chunk)
+                window = tail + chunk
+                search_window = window.lower() if case_insensitive else window
+                search_from = 0
+                while True:
+                    index = search_window.find(match_needle, search_from)
+                    if index < 0:
+                        break
+                    hit_address = read_address - len(tail) + index
+                    if hit_address not in seen_hits:
+                        seen_hits.add(hit_address)
+                        hits.append(
+                            {
+                                "address": f"0x{hit_address:X}",
+                                "page_base": f"0x{page_base:X}",
+                                "page_info": page_info,
+                            }
+                        )
+                        if len(hits) >= safe_max_hits:
+                            break
+                    search_from = index + 1
+
+                if overlap > 0 and len(window) > overlap:
+                    tail = window[-overlap:]
+                else:
+                    tail = window
+                offset += len(chunk)
+
+        return {
+            "pattern_type": selected_type,
+            "pattern_size": needle_len,
+            "hit_count": len(hits),
+            "max_hits": safe_max_hits,
+            "max_pages": safe_max_pages,
+            "scanned_pages": scanned_pages,
+            "skipped_pages": skipped_pages,
+            "unreadable_pages": unreadable_pages,
+            "scanned_bytes": scanned_bytes,
+            "hits": hits,
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
 def write_memory_hex(address: int | str, hex_data: str) -> dict[str, Any]:
     """Write bytes to process memory using a hex string."""
     parsed_address = _parse_int(address, allow_expression=True)
@@ -962,23 +1794,41 @@ def set_breakpoint(
         return _error(ValueError("address_or_symbol is required"))
     bp_kind = _parse_standard_bp_kind(kind)
     bp_name = name.strip() or None
-    return _run(
-        lambda: {
-            "set": _require_client().set_breakpoint(
-                parsed,
-                name=bp_name,
-                bp_type=bp_kind,
-                singleshoot=singleshot,
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        updated = client.set_breakpoint(
+            parsed,
+            name=bp_name,
+            bp_type=bp_kind,
+            singleshoot=singleshot,
+        )
+        if updated:
+            _remember_software_breakpoint(
+                SoftwareBreakpointSpec(
+                    target=parsed,
+                    kind=bp_kind,
+                    name=bp_name,
+                    singleshot=singleshot,
+                )
             )
-        }
-    )
+        return {"set": updated}
+
+    return _run(action)
 
 
 @mcp.tool()
 def clear_breakpoint(address_or_symbol: int | str | None = None) -> dict[str, Any]:
     """Clear one software breakpoint, or all software breakpoints if empty."""
     parsed = _parse_address_or_symbol(address_or_symbol)
-    return _run(lambda: {"cleared": _require_client().clear_breakpoint(parsed)})
+
+    def action() -> dict[str, Any]:
+        cleared = bool(_require_client().clear_breakpoint(parsed))
+        if cleared:
+            _forget_software_breakpoint(parsed)
+        return {"cleared": cleared}
+
+    return _run(action)
 
 
 @mcp.tool()
@@ -987,22 +1837,40 @@ def set_hardware_breakpoint(address_or_symbol: int | str, kind: str = "x", size:
     parsed = _parse_address_or_symbol(address_or_symbol)
     if parsed is None:
         return _error(ValueError("address_or_symbol is required"))
-    return _run(
-        lambda: {
-            "set": _require_client().set_hardware_breakpoint(
-                parsed,
-                bp_type=_parse_hw_kind(kind),
-                size=size,
+    parsed_kind = _parse_hw_kind(kind)
+    safe_size = max(1, int(size))
+
+    def action() -> dict[str, Any]:
+        updated = _require_client().set_hardware_breakpoint(
+            parsed,
+            bp_type=parsed_kind,
+            size=safe_size,
+        )
+        if updated:
+            _remember_hardware_breakpoint(
+                HardwareBreakpointSpec(
+                    target=parsed,
+                    kind=parsed_kind,
+                    size=safe_size,
+                )
             )
-        }
-    )
+        return {"set": updated}
+
+    return _run(action)
 
 
 @mcp.tool()
 def clear_hardware_breakpoint(address_or_symbol: int | str | None = None) -> dict[str, Any]:
     """Clear one hardware breakpoint, or all hardware breakpoints if empty."""
     parsed = _parse_address_or_symbol(address_or_symbol)
-    return _run(lambda: {"cleared": _require_client().clear_hardware_breakpoint(parsed)})
+
+    def action() -> dict[str, Any]:
+        cleared = bool(_require_client().clear_hardware_breakpoint(parsed))
+        if cleared:
+            _forget_hardware_breakpoint(parsed)
+        return {"cleared": cleared}
+
+    return _run(action)
 
 
 @mcp.tool()
@@ -1015,22 +1883,39 @@ def set_memory_breakpoint(
     parsed = _parse_address_or_symbol(address_or_symbol)
     if parsed is None:
         return _error(ValueError("address_or_symbol is required"))
-    return _run(
-        lambda: {
-            "set": _require_client().set_memory_breakpoint(
-                parsed,
-                bp_type=_parse_mem_kind(kind),
-                singleshoot=singleshot,
+    parsed_kind = _parse_mem_kind(kind)
+
+    def action() -> dict[str, Any]:
+        updated = _require_client().set_memory_breakpoint(
+            parsed,
+            bp_type=parsed_kind,
+            singleshoot=singleshot,
+        )
+        if updated:
+            _remember_memory_breakpoint(
+                MemoryBreakpointSpec(
+                    target=parsed,
+                    kind=parsed_kind,
+                    singleshot=singleshot,
+                )
             )
-        }
-    )
+        return {"set": updated}
+
+    return _run(action)
 
 
 @mcp.tool()
 def clear_memory_breakpoint(address_or_symbol: int | str | None = None) -> dict[str, Any]:
     """Clear one memory breakpoint, or all memory breakpoints if empty."""
     parsed = _parse_address_or_symbol(address_or_symbol)
-    return _run(lambda: {"cleared": _require_client().clear_memory_breakpoint(parsed)})
+
+    def action() -> dict[str, Any]:
+        cleared = bool(_require_client().clear_memory_breakpoint(parsed))
+        if cleared:
+            _forget_memory_breakpoint(parsed)
+        return {"cleared": cleared}
+
+    return _run(action)
 
 
 @mcp.tool()

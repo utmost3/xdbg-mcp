@@ -1,111 +1,112 @@
-# xdbg MCP CTF 逆向实战指南（zh-CN）
+﻿# xdbg-mcp CTF 逆向实战指南（中文）
 
-> 适用对象：用 `x64dbg/x32dbg + xdbg MCP` 做 CTF Reverse 辅助调试的选手。  
-> 目标：提高做题效率、减少卡顿、形成可复用流程。
+本文给出一套针对 CTF Reverse 的高效流程，默认你已完成 README 中的部署。
 
-## 1. 适用题型
+## 1. 目标
 
-本指南适用于：
+1. 快速定位校验路径
+2. 减少卡在输入/反调试/会话断连上的时间
+3. 形成可复用操作模板
 
-1. Windows Reverse（PE 程序、GUI CrackMe、命令行校验题）。
-2. 动态分析辅助静态逆向（字符串混淆、分支校验、内存生成 key）。
+## 2. 推荐流程（SOP）
 
-
-## 2. 环境建议
-
-1. `x64dbg`（含 `x32dbg/x64dbg/x96dbg`）。
-2. `x64dbg-automate` 插件（`dp32/dp64 + libzmq`）。
-3. `Python 3.11+`。
-4. `xdbg-mcp`。
-
-部署建议：
-
-1. 插件文件必须落到“你实际使用的 xdbg 可执行文件同级目录下的 `plugins`”。
-2. 只安装 Python 包不够，`dp32/dp64/libzmq` 仍需手动复制。
-3. 插件下载建议直接使用官方 Releases：`https://github.com/dariushoule/x64dbg-automate/releases`。
-4. 完整搭建步骤请先按 README 的“完整部署（Windows）”执行，再做本指南中的题目流程。
-
-## 3. 快速启动
-
-```powershell
-python -m xdbg_mcp --xdbg-path <X64DBG_DIR>\x96dbg.exe
-```
-
-首次连通建议调用顺序：
+### Step 1：启动与自检
 
 1. `health`
-2. `start_session`（或 `list_sessions` + `connect_session`）
+2. `start_session(target_exe=..., xdbg_path=...x96dbg.exe)`
 3. `debugger_status`
-4. `run_to`（关键地址）+ `snapshot_context`
 
-## 4. CTF 标准做题流程（SOP）
+### Step 2：跑到关键点
 
-### 4.1 赛前准备
+优先用：
 
-1. 先做静态浏览：导入表、字符串、可疑常量。
-2. 明确目标：找正确输入、过校验、还原算法，还是做 patch。
+- `run_to`
+- `set_breakpoint + go + wait_until_stopped(detailed=true)`
 
-### 4.2 动态调试
+`wait_until_stopped(detailed=true)` 的重点字段：
 
-1. 在入口、按钮分发、比较函数（如 `lstrcmp/memcmp`）下断点。
-2. 用 `step_over` 快速穿过系统库，关键点再 `step_into`。
-3. 用 `read_memory/get_register(s)` 抓中间值。
-4. 在循环生成逻辑里读缓冲区，优先拿“程序真实期望值”。
+- `matched`
+- `timed_out`
+- `stop_reason`
+- `stop_event`
+- `instruction_pointer`
 
-### 4.3 收敛答案
+### Step 3：抓上下文
 
-1. 用断点验证比较返回值（例如 `EAX==0`）。
-2. 再验证是否走成功分支（比如跳转到 success block）。
-3. 最后再手动输入确认 UI 提示一致。
+1. `snapshot_context`
+2. `read_memory`
+3. `get_register(s)`
 
-## 5. xdbg MCP 高效用法
+### Step 4：细化执行
 
-推荐高频工具：
+- `step_over`：快速跨系统调用
+- `step_into`：进入关键算法
+- `step_trace`：批量单步并观察寄存器变化
 
-1. 会话：`start_session` / `connect_session` / `terminate_session`
-2. 控制：`run_to` / `go` / `pause` / `step_over` / `wait_until_stopped`
-3. 观察：`get_register` / `get_registers` / `read_memory` / `disassemble`
-4. 快照：`snapshot_context`（寄存器 + 当前指令 + 栈）
-5. 断点：`set_breakpoint` / `list_breakpoints` / `clear_breakpoint`
-6. 修改：`write_memory_hex` / `set_register`
+### Step 5：验证假设
 
-实战建议：
+- 用 `run_until_expr` 跑到目标条件
+- 用 `find_memory_pattern` 找关键常量/标记串
+- 必要时 `write_memory_hex` 做最小实验性 patch
 
-1. 异常密集区别长时间 `go`，优先短跑 + 单步。
-2. `wait_until_*` 超时后先看 `health`，再做重连，不要盲目重复下断点。
-3. 题目路径尽量 ASCII，减少路径编码问题。
+## 3. 输入阻塞（scanf/read/fgets）处理
 
-## 6. 常见问题与处理
+如果程序在输入点卡住，不要盲目 `go`。
 
-### Q1: `start_session` 失败
+推荐工具：`inject_string_and_continue`
 
-排查顺序：
+参数语义：
 
-1. 位数是否匹配（32 位题目优先 `x32dbg`）。
-2. 插件是否齐全（`x64dbg-automate.dp32/.dp64 + libzmq`）。
-3. 路径是否存在、是否可读。
+- `buffer_address`：输入缓冲区地址（可写表达式，如 `ebp-0x96`）
+- `text`：你要注入的候选输入
+- `continue_at`：跳过输入调用后的地址
+- `encoding`：`ascii` / `utf-8` / `utf-16le`
+- `append_null`：是否补零结尾
 
-### Q2: `go/wait` 经常超时
+典型链路：
 
-1. 使用短周期断点推进，不要无限运行。
-2. 优先 `step_over` 穿系统函数。
-3. 必要时 `disconnect -> connect_session` 恢复会话。
+1. 停在输入调用附近
+2. `inject_string_and_continue`
+3. `run_to` 到比较分支
+4. `snapshot_context` 验证比较结果
 
-### Q3: `command` 返回 `executed=false`
+## 4. 断连与恢复策略
 
-1. 某些命令在当前状态不可执行是正常现象。
-2. 优先使用结构化工具（`set_breakpoint/read_memory/...`），少依赖 raw command。
+本项目已支持自动重连并恢复 MCP 下发的断点。
 
-## 7. 比赛中可复用模板
+建议：
 
-建议仓库里固定这几类模板：
+1. 出现瞬时异常先看 `health`
+2. 关注 `reconnect_count`
+3. 如确实错乱，`disconnect` 后 `connect_session`
 
-1. `docs/CTF_RE_WORKFLOW_zh-CN.md`（本文件）
-2. `docs/CTF_WRITEUP_TEMPLATE.md`
-3. `scripts/patch_template.py`（自动改跳转/改比较）
-4. `scripts/keygen_template.py`（按中间值生成答案）
+## 5. 事件队列调试
 
-## 8. 合规声明
+新增工具：
 
-1. 仅用于 CTF、授权练习与教学研究。
-2. 不用于未授权目标。
+1. `get_latest_event`
+2. `drain_events`
+3. `wait_for_event`
+
+用途：
+
+- 明确到底是 `breakpoint`、`exception` 还是 `pause`
+- 解决“为什么停下/为什么没停到预期地址”
+
+## 6. 常见失误
+
+1. 只看 `run_to` 返回，不看 `instruction_pointer`
+2. 命中其他断点却误判“到目标”
+3. 输入阻塞时长时间 `go`，导致超时
+4. 没有记录每次关键断点的寄存器和内存
+
+## 7. 一段最小实战模板
+
+1. `start_session`
+2. `run_to(入口)`
+3. `set_breakpoint(比较点)`
+4. `go`
+5. `wait_until_stopped(detailed=true)`
+6. `snapshot_context`
+7. 必要时 `inject_string_and_continue`
+8. 重复 4~7，直到收敛出 flag
