@@ -7,72 +7,105 @@ Description-Content-Type: text/markdown
 Requires-Dist: mcp>=1.26.0
 Requires-Dist: x64dbg_automate>=0.7.5
 
-# xdbg-mcp
+﻿# xdbg-mcp
 
-MCP server for `x64dbg/x32dbg/x96dbg`, built on top of `x64dbg_automate`.
+基于 `x64dbg_automate` 的 x64dbg/x32dbg/x96dbg MCP 服务端，面向 CTF 逆向与日常动态分析。
 
-## Capabilities
+## 这次升级了什么
 
-- Session management: `list/start/connect/disconnect/terminate`.
-- Execution control: `go/pause/step_into/step_over/wait`.
-- Registers and memory read/write.
-- Software/hardware/memory breakpoints.
-- Disassemble and assemble at arbitrary addresses.
-- Auto-reconnect and retry for transient session failures.
-- Bitness-aware debugger selection (`x96dbg` auto-picks `x32dbg/x64dbg` by target PE).
-- Startup hardening: plugin dependency checks and non-ASCII target path fallback copy.
+本次版本重点增强了实战稳定性：
 
-## Full Deployment (Windows)
+1. `run_to` / `wait_until_stopped` 增加停下原因诊断
+- 可返回 `stop_reason`、`stop_event`、当前 `instruction_pointer`
+- `run_to` 不再“只要停下就算到达”，会校验是否真的命中目标地址
 
-### 1) Install prerequisites
+2. 自动重连后恢复断点
+- MCP 记录通过工具下的软/硬件/内存断点
+- 会话瞬断后自动重连时会尝试恢复断点
+- `health` 可查看断点跟踪数量和重连计数
 
-1. Install Python `3.11+`.
-2. Install x64dbg release package that includes `x32dbg.exe`, `x64dbg.exe`, `x96dbg.exe`.
-3. Confirm your debugger root path, for example `D:\tools\x64dbg\release`.
+3. 新增事件队列工具
+- `get_latest_event`
+- `drain_events`
+- `wait_for_event`
 
-### 2) Install x64dbg automate plugin files
+4. 新增 CTF 输入卡住绕过工具
+- `write_text_memory`
+- `inject_string_and_continue`
 
-Put the following files into `<xdbg_release_dir>\plugins\`:
+适用场景：程序卡在 `scanf/read/fgets` 时，直接写入目标缓冲区并把 `EIP/RIP` 跳到调用后。
 
-1. `x64dbg-automate.dp32`
-2. `x64dbg-automate.dp64`
-3. `libzmq-mt-4_3_5.dll`
+## 支持客户端
 
-Expected layout example:
+已支持以下 MCP 客户端（stdio 启动方式）：
+
+1. Cursor
+2. Claude Desktop
+3. Cline
+4. Roo Code
+5. Cherry Studio
+6. Codex
+
+## 完整部署（Windows）
+
+### 1. 前置依赖
+
+1. Python 3.11+
+2. Git
+3. x64dbg（含 `x32dbg.exe` / `x64dbg.exe` / `x96dbg.exe`）
+
+建议统一目录示例：
 
 ```text
-D:\tools\x64dbg\release\x32dbg.exe
-D:\tools\x64dbg\release\x64dbg.exe
 D:\tools\x64dbg\release\x96dbg.exe
-D:\tools\x64dbg\release\plugins\x64dbg-automate.dp32
-D:\tools\x64dbg\release\plugins\x64dbg-automate.dp64
-D:\tools\x64dbg\release\plugins\libzmq-mt-4_3_5.dll
 ```
 
-### 3) Install this MCP server
+### 2. 安装 x64dbg-automate 插件文件
+
+从官方 Releases 下载下面 3 个文件：
+
+- `x64dbg-automate.dp32`
+- `x64dbg-automate.dp64`
+- `libzmq-mt-4_3_5.dll`
+
+下载地址：
+
+- https://github.com/dariushoule/x64dbg-automate/releases
+
+把这 3 个文件放到你实际使用的调试器插件目录（常见二选一）：
+
+```text
+<X64DBG_DIR>\plugins\
+```
+
+```text
+<X64DBG_DIR>\x32\plugins\
+<X64DBG_DIR>\x64\plugins\
+```
+
+### 3. 安装本项目
 
 ```powershell
+git clone https://github.com/utmost3/xdbg-mcp.git
 cd xdbg-mcp
 python -m pip install -U pip
 python -m pip install -e .
 ```
 
-### 4) Start MCP server
+### 4. 启动 MCP 服务
 
-Use either command:
+```powershell
+python -m xdbg_mcp --xdbg-path D:\tools\x64dbg\release\x96dbg.exe
+```
+
+或：
 
 ```powershell
 set XDBG_PATH=D:\tools\x64dbg\release\x96dbg.exe
 xdbg-mcp
 ```
 
-```powershell
-python -m xdbg_mcp --xdbg-path D:\tools\x64dbg\release\x96dbg.exe
-```
-
-### 5) MCP client config example
-
-Copy this into your MCP client config:
+### 5. MCP 客户端配置示例
 
 ```json
 {
@@ -90,53 +123,61 @@ Copy this into your MCP client config:
 }
 ```
 
-A copy is also provided in `mcp.client.json.example`.
+仓库示例文件：`mcp.client.json.example`
 
-### 6) Smoke test after startup
+## 常用工具
 
-Run these calls in order:
+- 会话：`health` `list_sessions` `start_session` `connect_session` `disconnect` `terminate_session`
+- 执行：`go` `pause` `step_into` `step_over` `step_trace` `run_to` `run_until_expr`
+- 等待：`wait_until_running` `wait_until_stopped`
+- 观察：`snapshot_context` `get_register(s)` `read_memory` `disassemble`
+- 断点：`set/clear/list_breakpoint` `set/clear_hardware_breakpoint` `set/clear_memory_breakpoint`
+- 内存：`write_memory_hex` `write_text_memory` `find_memory_pattern`
+- 事件：`get_latest_event` `drain_events` `wait_for_event`
+- 输入绕过：`inject_string_and_continue`
 
-1. `health`
-2. `start_session` with `target_exe=<your_challenge.exe>`
-3. `debugger_status`
-4. `set_breakpoint` at a known address, then `go`
+## CTF 卡输入快速处理
 
-If `health.connected=true` and `debugger_status` returns valid process/debugger info, deployment is complete.
+假设当前停在 `scanf` 调用前后，且输入缓冲区地址是 `ebp-0x96`，调用返回后地址是 `0x40179E`：
 
-## Reliability Environment Flags
+1. 直接写入候选字符串
 
-- `XDBG_MCP_AUTO_RECONNECT=1|0`  
-Enable/disable automatic reconnect to local sessions after transient failures. Default: `1`.
-- `XDBG_MCP_RETRY_ATTEMPTS=<int>`  
-Per-tool retry attempts for transient failures. Default: `2`.
-- `XDBG_MCP_WAIT_POLL_MS=<int>`  
-Polling interval for `wait_until_running/stopped`. Default: `100`.
-- `XDBG_MCP_SKIP_PLUGIN_CHECK=1|0`  
-Skip startup checks for `x64dbg-automate.dp32/.dp64` and `libzmq`. Default: `0`.
+```json
+{
+  "buffer_address": "ebp-0x96",
+  "text": "flag{...}",
+  "continue_at": "0x40179E",
+  "encoding": "ascii",
+  "append_null": true
+}
+```
 
-## Common Startup Errors
+调用工具：`inject_string_and_continue`
 
-1. `Missing x64dbg automate plugin dependencies`  
-Cause: plugin files not in debugger `plugins` dir.  
-Fix: copy `dp32/dp64/libzmq` to the exact folder shown in error text.
-2. `Failed to load executable`  
-Cause: target path/bitness mismatch, or invalid executable path.  
-Fix: verify `target_exe` exists; prefer `x96dbg.exe`; avoid non-ASCII path when possible.
-3. `Not connected to x64dbg`  
-Cause: no active session or stale session.  
-Fix: run `start_session` or `connect_session`; check `health`.
+2. 再用 `run_to` / `wait_until_stopped(detailed=true)` 看是否命中校验分支
 
-## CTF Quick Flow
+## 环境变量
 
-用于常见 Reverse/CrackMe 题目的推荐调用顺序：
+- `XDBG_MCP_AUTO_RECONNECT=1|0`：是否启用自动重连（默认 `1`）
+- `XDBG_MCP_RETRY_ATTEMPTS=<int>`：瞬时错误重试次数（默认 `2`）
+- `XDBG_MCP_WAIT_POLL_MS=<int>`：等待轮询间隔毫秒（默认 `100`）
+- `XDBG_MCP_EVENT_DRAIN_LIMIT=<int>`：单次事件拉取上限（默认 `64`）
+- `XDBG_MCP_SKIP_PLUGIN_CHECK=1|0`：跳过插件依赖检查（默认 `0`）
 
-1. 用 `start_session` 启动题目，传入 `target_exe=<challenge.exe>` 与 `xdbg_path=<x96dbg.exe>`。
-2. 用 `set_breakpoint` 在入口、比较分支、关键 API（`memcmp`、`lstrcmp*` 调用点）下断点。
-3. 用 `go` + `wait_until_stopped` 跑到关键逻辑位置。
-4. 用 `get_register` / `get_registers` 读取分支关键值（例如比较后的 `EAX`）。
-5. 用 `read_memory` 抓缓冲区或 key 的中间态，优先拿“程序真实期望值”。
-6. 用 `step_over` / `step_into` 收敛路径，逻辑确认后再用 `write_memory_hex` 做最小 patch。
+## 常见问题
 
-## CTF Guide
+1. `Missing x64dbg automate plugin dependencies`
+- 原因：插件文件不在实际生效的 `plugins` 目录
+- 处理：把 3 个文件放到报错提示目录
 
-- [CTF Reverse Workflow (zh-CN)](docs/CTF_RE_WORKFLOW_zh-CN.md)
+2. `run_to` 未到达目标
+- 先看返回里的 `reached`、`stop_reason`、`instruction_pointer`
+- 若是命中其他断点，可清理后重试
+
+3. `wait_until_stopped` 超时
+- 可用 `pause_on_timeout=true`
+- 或用 `inject_string_and_continue` 跳过阻塞输入调用
+
+## CTF 工作流文档
+
+- [CTF 逆向实战指南（中文）](docs/CTF_RE_WORKFLOW_zh-CN.md)

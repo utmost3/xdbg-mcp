@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.26.0",
+  "pefile>=2023.2.7",
   "x64dbg_automate>=0.7.5",
 ]
 

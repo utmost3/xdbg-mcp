@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import enum
+import hashlib
+import json
+import math
 import os
 import shutil
 import struct
@@ -21,6 +24,11 @@ from x64dbg_automate.models import (
     MemoryBreakpointType,
     StandardBreakpointType,
 )
+
+try:
+    import pefile
+except Exception:  # pragma: no cover - optional dependency fallback
+    pefile = None
 
 MAX_MEMORY_RW = 0x10000
 TRANSIENT_ERROR_MARKERS = (
@@ -58,6 +66,74 @@ STOP_RELEVANT_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.EVENT_STEPPED,
     EventType.EVENT_STOP_DEBUG,
     EventType.EVENT_EXIT_PROCESS,
+)
+BREAKPOINT_QUERY_ORDER: tuple[BreakpointType, ...] = (
+    BreakpointType.BpNormal,
+    BreakpointType.BpHardware,
+    BreakpointType.BpMemory,
+    BreakpointType.BpDll,
+    BreakpointType.BpException,
+)
+PAGE_PROTECT_FLAGS: tuple[tuple[int, str], ...] = (
+    (0x100, "GUARD"),
+    (0x200, "NOCACHE"),
+    (0x400, "WRITECOMBINE"),
+)
+PAGE_PROTECT_BASE_NAMES: dict[int, str] = {
+    0x01: "NOACCESS",
+    0x02: "R",
+    0x04: "RW",
+    0x08: "WC",
+    0x10: "X",
+    0x20: "XR",
+    0x40: "XRW",
+    0x80: "XWC",
+}
+MEM_STATE_NAMES: dict[int, str] = {
+    0x1000: "COMMIT",
+    0x2000: "RESERVE",
+    0x10000: "FREE",
+}
+MEM_TYPE_NAMES: dict[int, str] = {
+    0x20000: "PRIVATE",
+    0x40000: "MAPPED",
+    0x1000000: "IMAGE",
+}
+PACKER_SECTION_HINTS: tuple[str, ...] = (
+    ".vmp",
+    "vmp",
+    ".upx",
+    "upx",
+    ".themida",
+    "themida",
+    ".enigma",
+    "enigma",
+    ".mpress",
+    "mpress",
+    ".aspack",
+    "aspack",
+    ".petite",
+    "petite",
+    ".packed",
+    "packed",
+    ".stub",
+)
+PACKER_API_HINTS: tuple[str, ...] = (
+    "VirtualAlloc",
+    "VirtualProtect",
+    "VirtualQuery",
+    "WriteProcessMemory",
+    "MapViewOfFile",
+    "CreateFileMapping",
+    "LoadLibraryA",
+    "LoadLibraryW",
+    "GetProcAddress",
+    "SetUnhandledExceptionFilter",
+    "AddVectoredExceptionHandler",
+    "NtAllocateVirtualMemory",
+    "NtProtectVirtualMemory",
+    "NtQueryInformationProcess",
+    "LdrLoadDll",
 )
 
 
@@ -343,24 +419,181 @@ def _drain_debug_events(client: X64DbgClient, max_events: int | None = None) -> 
 
 
 def _derive_stop_reason(events: list[DbgEvent]) -> tuple[str, dict[str, Any] | None]:
-    for event in reversed(events):
-        if event.event_type not in STOP_RELEVANT_EVENT_TYPES:
-            continue
-        payload = _event_to_payload(event)
-        if event.event_type in (EventType.EVENT_BREAKPOINT, EventType.EVENT_SYSTEMBREAKPOINT):
-            return "breakpoint", payload
-        if event.event_type == EventType.EVENT_EXCEPTION:
-            return "exception", payload
-        if event.event_type == EventType.EVENT_PAUSE_DEBUG:
-            return "paused", payload
-        if event.event_type == EventType.EVENT_STEPPED:
-            return "stepped", payload
-        if event.event_type == EventType.EVENT_EXIT_PROCESS:
-            return "process_exit", payload
-        if event.event_type == EventType.EVENT_STOP_DEBUG:
-            return "debug_stopped", payload
-        return str(event.event_type).lower(), payload
+    priority_groups: tuple[tuple[EventType, ...], ...] = (
+        (EventType.EVENT_EXCEPTION,),
+        (EventType.EVENT_BREAKPOINT, EventType.EVENT_SYSTEMBREAKPOINT),
+        (EventType.EVENT_STEPPED,),
+        (EventType.EVENT_EXIT_PROCESS,),
+        (EventType.EVENT_STOP_DEBUG,),
+        (EventType.EVENT_PAUSE_DEBUG,),
+    )
+    for group in priority_groups:
+        for event in reversed(events):
+            if event.event_type not in group:
+                continue
+            payload = _event_to_payload(event)
+            if event.event_type in (EventType.EVENT_BREAKPOINT, EventType.EVENT_SYSTEMBREAKPOINT):
+                return "breakpoint", payload
+            if event.event_type == EventType.EVENT_EXCEPTION:
+                return "exception", payload
+            if event.event_type == EventType.EVENT_PAUSE_DEBUG:
+                return "paused", payload
+            if event.event_type == EventType.EVENT_STEPPED:
+                return "stepped", payload
+            if event.event_type == EventType.EVENT_EXIT_PROCESS:
+                return "process_exit", payload
+            if event.event_type == EventType.EVENT_STOP_DEBUG:
+                return "debug_stopped", payload
+            return str(event.event_type).lower(), payload
     return "unknown", None
+
+
+def _breakpoint_detail_label(bp_type: BreakpointType | int | None) -> str:
+    mapping = {
+        BreakpointType.BpNormal: "software",
+        BreakpointType.BpHardware: "hardware",
+        BreakpointType.BpMemory: "memory",
+        BreakpointType.BpDll: "dll",
+        BreakpointType.BpException: "exception_breakpoint",
+    }
+    try:
+        normalized = bp_type if isinstance(bp_type, BreakpointType) else BreakpointType(bp_type or 0)
+    except Exception:
+        return "unknown"
+    return mapping.get(normalized, str(normalized).lower())
+
+
+def _snapshot_breakpoints(client: X64DbgClient) -> dict[int, list[dict[str, Any]]]:
+    snapshot: dict[int, list[dict[str, Any]]] = {}
+    seen: set[tuple[int, int, str, str]] = set()
+    for kind in BREAKPOINT_QUERY_ORDER:
+        try:
+            items = client.get_breakpoints(kind)
+        except Exception:
+            continue
+        for bp in items:
+            payload = _to_jsonable(bp)
+            if not isinstance(payload, dict):
+                continue
+            addr = int(payload.get("addr", -1))
+            if addr < 0:
+                continue
+            key = (
+                addr,
+                int(payload.get("type", 0)),
+                str(payload.get("mod", "")),
+                str(payload.get("name", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            payload["detail"] = _breakpoint_detail_label(getattr(bp, "type", None))
+            snapshot.setdefault(addr, []).append(payload)
+    return snapshot
+
+
+def _find_breakpoints_at_address(client: X64DbgClient, address: int) -> list[dict[str, Any]]:
+    snapshot = _snapshot_breakpoints(client)
+    matches = snapshot.get(address, [])
+    return matches
+
+
+def _find_memory_page_for_address(client: X64DbgClient, address: int) -> dict[str, Any] | None:
+    try:
+        pages = client.memmap()
+    except Exception:
+        return None
+    for page in pages:
+        base_address = int(getattr(page, "base_address", 0))
+        region_size = int(getattr(page, "region_size", 0))
+        if base_address <= address < (base_address + max(0, region_size)):
+            payload = _to_jsonable(page)
+            if isinstance(payload, dict):
+                payload["offset"] = address - base_address
+                return payload
+            return None
+    return None
+
+
+def _infer_stop_details(client: X64DbgClient, instruction_pointer_value: int | None) -> dict[str, Any]:
+    if not isinstance(instruction_pointer_value, int):
+        return {}
+    payload: dict[str, Any] = {}
+    matched_breakpoints = _find_breakpoints_at_address(client, instruction_pointer_value)
+    if matched_breakpoints:
+        payload["matched_breakpoints"] = matched_breakpoints
+        primary = matched_breakpoints[0]
+        payload["inferred_stop_reason"] = "breakpoint"
+        payload["inferred_stop_reason_detail"] = primary.get("detail", "unknown")
+        payload["inferred_stop_event"] = {
+            "event_type": "INFERRED_BREAKPOINT",
+            "event_data": primary,
+        }
+    instruction_page = _find_memory_page_for_address(client, instruction_pointer_value)
+    if instruction_page is not None:
+        payload["instruction_page"] = instruction_page
+    return payload
+
+
+def _events_since_last_resume(events: list[DbgEvent]) -> list[DbgEvent]:
+    for index in range(len(events) - 1, -1, -1):
+        if events[index].event_type == EventType.EVENT_RESUME_DEBUG:
+            return events[index:]
+    return events
+
+
+def _build_stop_details_from_events(
+    client: X64DbgClient,
+    events: list[DbgEvent],
+    *,
+    include_events: bool,
+    instruction_pointer_value: int | None = None,
+) -> dict[str, Any]:
+    stop_reason, stop_event = _derive_stop_reason(events)
+    inferred = _infer_stop_details(client, instruction_pointer_value)
+    if stop_reason in ("unknown", "paused") and inferred.get("inferred_stop_reason"):
+        stop_reason = str(inferred["inferred_stop_reason"])
+        stop_event = inferred.get("inferred_stop_event")
+    payload: dict[str, Any] = {
+        "stop_reason": stop_reason,
+        "stop_event": stop_event,
+    }
+    if stop_event is not None:
+        payload["stop_reason_source"] = "events"
+    if "inferred_stop_reason" in inferred:
+        payload["inferred_stop_reason"] = inferred["inferred_stop_reason"]
+        payload["inferred_stop_reason_detail"] = inferred.get("inferred_stop_reason_detail")
+        if payload.get("stop_reason_source") is None:
+            payload["stop_reason_source"] = "inferred"
+    if "matched_breakpoints" in inferred:
+        payload["matched_breakpoints"] = inferred["matched_breakpoints"]
+    if "instruction_page" in inferred:
+        payload["instruction_page"] = inferred["instruction_page"]
+    if include_events:
+        payload["events"] = [_event_to_payload(item) for item in events]
+    return payload
+
+
+def _apply_breakpoint_inference(
+    wait_result: dict[str, Any],
+    matched_breakpoints: list[dict[str, Any]],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    if not matched_breakpoints:
+        return wait_result
+    payload = dict(wait_result)
+    payload["matched_breakpoints"] = matched_breakpoints
+    payload["inferred_stop_reason"] = "breakpoint"
+    payload["inferred_stop_reason_detail"] = matched_breakpoints[0].get("detail", "unknown")
+    if payload.get("stop_reason") in ("unknown", "paused", None):
+        payload["stop_reason"] = "breakpoint"
+        payload["stop_event"] = {
+            "event_type": "INFERRED_BREAKPOINT",
+            "event_data": matched_breakpoints[0],
+        }
+        payload["stop_reason_source"] = source
+    return payload
 
 
 def _collect_stop_details(
@@ -368,16 +601,51 @@ def _collect_stop_details(
     *,
     include_events: bool,
     max_events: int | None = None,
+    instruction_pointer_value: int | None = None,
 ) -> dict[str, Any]:
     events = _drain_debug_events(client, max_events=max_events)
-    stop_reason, stop_event = _derive_stop_reason(events)
-    payload: dict[str, Any] = {
-        "stop_reason": stop_reason,
-        "stop_event": stop_event,
+    return _build_stop_details_from_events(
+        client,
+        events,
+        include_events=include_events,
+        instruction_pointer_value=instruction_pointer_value,
+    )
+
+
+def _did_hit_target(wait_result: dict[str, Any], target_address: int | None) -> bool:
+    if target_address is None or not bool(wait_result.get("matched")):
+        return False
+    ip_value = wait_result.get("instruction_pointer_value")
+    if isinstance(ip_value, int) and ip_value == target_address:
+        return True
+
+    stop_event = wait_result.get("stop_event")
+    if isinstance(stop_event, dict):
+        event_data = stop_event.get("event_data")
+        if isinstance(event_data, dict):
+            stop_addr = event_data.get("addr")
+            if isinstance(stop_addr, int):
+                return stop_addr == target_address
+    return False
+
+
+def _compact_stop_summary(wait_result: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "stop_reason": wait_result.get("stop_reason"),
+        "stop_reason_source": wait_result.get("stop_reason_source"),
+        "instruction_pointer": wait_result.get("instruction_pointer"),
+        "instruction_pointer_value": wait_result.get("instruction_pointer_value"),
+        "instruction": wait_result.get("instruction"),
+        "stop_event": wait_result.get("stop_event"),
     }
-    if include_events:
-        payload["events"] = [_event_to_payload(item) for item in events]
-    return payload
+    if "matched_breakpoints" in wait_result:
+        summary["matched_breakpoints"] = wait_result.get("matched_breakpoints")
+    if "instruction_page" in wait_result:
+        summary["instruction_page"] = wait_result.get("instruction_page")
+    events = wait_result.get("events")
+    if isinstance(events, list) and events:
+        summary["events"] = events
+    return summary
 
 
 def _set_first_register(client: X64DbgClient, names: tuple[str, ...], value: int) -> str:
@@ -840,6 +1108,343 @@ def _validate_rw_size(size: int) -> int:
     return size
 
 
+def _protect_base(value: int) -> int:
+    return int(value) & 0xFF
+
+
+def _protect_to_text(value: int) -> str:
+    base = _protect_base(value)
+    parts = [PAGE_PROTECT_BASE_NAMES.get(base, f"0x{base:X}")]
+    for flag, name in PAGE_PROTECT_FLAGS:
+        if int(value) & flag:
+            parts.append(name)
+    return "|".join(parts)
+
+
+def _state_to_text(value: int) -> str:
+    return MEM_STATE_NAMES.get(int(value), f"0x{int(value):X}")
+
+
+def _type_to_text(value: int) -> str:
+    return MEM_TYPE_NAMES.get(int(value), f"0x{int(value):X}")
+
+
+def _is_executable_protect(value: int) -> bool:
+    return _protect_base(value) in (0x10, 0x20, 0x40, 0x80)
+
+
+def _is_writable_protect(value: int) -> bool:
+    return _protect_base(value) in (0x04, 0x08, 0x40, 0x80)
+
+
+def _decode_section_name(raw_name: bytes) -> str:
+    return raw_name.rstrip(b"\x00").decode("ascii", errors="replace")
+
+
+def _shannon_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for byte in data:
+        counts[byte] += 1
+    total = float(len(data))
+    entropy = 0.0
+    for count in counts:
+        if count == 0:
+            continue
+        p = count / total
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def _read_file_chunks(path: Path, chunk_size: int = 0x10000) -> bytes:
+    with path.open("rb") as fh:
+        return fh.read()
+
+
+def _pe_directory_size(pe: Any, name: str) -> int:
+    directory_indices = {
+        "IMAGE_DIRECTORY_ENTRY_IMPORT": 1,
+        "IMAGE_DIRECTORY_ENTRY_BASERELOC": 5,
+        "IMAGE_DIRECTORY_ENTRY_TLS": 9,
+    }
+    try:
+        index = directory_indices[name]
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[index]
+    except Exception:
+        return 0
+    size = int(getattr(directory, "Size", 0) or 0)
+    return size
+
+
+def _pe_has_tls_callbacks(pe: Any) -> bool:
+    try:
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[9]
+        return bool(int(getattr(directory, "VirtualAddress", 0) or 0))
+    except Exception:
+        return False
+
+
+def _section_characteristics_summary(section: Any) -> dict[str, bool]:
+    chars = int(getattr(section, "Characteristics", 0))
+    return {
+        "executable": bool(chars & 0x20000000),
+        "readable": bool(chars & 0x40000000),
+        "writable": bool(chars & 0x80000000),
+    }
+
+
+def _main_module_pages(client: X64DbgClient) -> list[Any]:
+    pages = client.memmap()
+    image_pages = [
+        page
+        for page in pages
+        if int(getattr(page, "type", 0)) == 0x1000000 and str(getattr(page, "info", "")).strip()
+    ]
+    if not image_pages:
+        return []
+    counts: dict[int, int] = {}
+    for page in image_pages:
+        base = int(getattr(page, "allocation_base", 0))
+        counts[base] = counts.get(base, 0) + 1
+    best_base = max(counts, key=counts.get)
+    return [page for page in image_pages if int(getattr(page, "allocation_base", 0)) == best_base]
+
+
+def _page_payload(page: Any) -> dict[str, Any]:
+    base_address = int(getattr(page, "base_address", 0))
+    region_size = int(getattr(page, "region_size", 0))
+    protect = int(getattr(page, "protect", 0))
+    state = int(getattr(page, "state", 0))
+    page_type = int(getattr(page, "type", 0))
+    return {
+        "base_address": f"0x{base_address:X}",
+        "base_address_value": base_address,
+        "allocation_base": f"0x{int(getattr(page, 'allocation_base', 0)):X}",
+        "allocation_base_value": int(getattr(page, "allocation_base", 0)),
+        "region_size": region_size,
+        "protect": protect,
+        "protect_text": _protect_to_text(protect),
+        "state": state,
+        "state_text": _state_to_text(state),
+        "type": page_type,
+        "type_text": _type_to_text(page_type),
+        "info": str(getattr(page, "info", "")),
+        "is_executable": _is_executable_protect(protect),
+        "is_writable": _is_writable_protect(protect),
+    }
+
+
+def _chunked_read_process_memory(client: X64DbgClient, address: int, size: int) -> bytes:
+    remaining = max(0, int(size))
+    cursor = int(address)
+    chunks: list[bytes] = []
+    while remaining > 0:
+        to_read = min(MAX_MEMORY_RW, remaining)
+        chunk = client.read_memory(cursor, to_read)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        read_size = len(chunk)
+        cursor += read_size
+        remaining -= read_size
+        if read_size < to_read:
+            break
+    return b"".join(chunks)
+
+
+def _score_page_suspicion(
+    page_payload: dict[str, Any],
+    *,
+    current_ip: int | None,
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    base_address = int(page_payload.get("base_address_value", 0))
+    region_size = int(page_payload.get("region_size", 0))
+    info_text = str(page_payload.get("info", "")).lower()
+    if page_payload.get("is_executable") and page_payload.get("type_text") == "PRIVATE":
+        score += 40
+        reasons.append("private executable page")
+    if page_payload.get("is_executable") and page_payload.get("is_writable"):
+        score += 35
+        reasons.append("writable executable page")
+    if page_payload.get("type_text") == "PRIVATE" and "heap" not in info_text and region_size >= 0x1000:
+        score += 10
+        reasons.append("private committed region")
+    if any(hint in info_text for hint in ("vmp", ".hello", ".themida", ".packed")):
+        score += 15
+        reasons.append("suspicious section/module label")
+    if isinstance(current_ip, int) and base_address <= current_ip < (base_address + max(0, region_size)):
+        score += 50
+        reasons.append("current IP is inside this page")
+    return score, reasons
+
+
+def _require_pefile() -> Any:
+    if pefile is None:
+        raise RuntimeError("pefile is required for PE profiling. Install dependency: pefile")
+    return pefile
+
+
+def _profile_pe_file_impl(file_path: str) -> dict[str, Any]:
+    pe_mod = _require_pefile()
+    path = Path(file_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"PE file not found: {file_path}")
+    raw = _read_file_chunks(path)
+    pe = pe_mod.PE(str(path), fast_load=False)
+    sha256 = hashlib.sha256(raw).hexdigest()
+
+    section_payloads: list[dict[str, Any]] = []
+    executable_high_entropy = 0
+    suspicious_section_names: list[str] = []
+    entry_section_name = ""
+    entry_rva = int(pe.OPTIONAL_HEADER.AddressOfEntryPoint)
+    try:
+        entry_section = pe.get_section_by_rva(entry_rva)
+    except Exception:
+        entry_section = None
+    if entry_section is not None:
+        entry_section_name = _decode_section_name(entry_section.Name)
+
+    for section in pe.sections:
+        name = _decode_section_name(section.Name)
+        data = section.get_data()
+        entropy = _shannon_entropy(data)
+        flags = _section_characteristics_summary(section)
+        name_lower = name.lower()
+        suspicious_name = any(hint in name_lower for hint in PACKER_SECTION_HINTS)
+        if suspicious_name:
+            suspicious_section_names.append(name)
+        if flags["executable"] and entropy >= 7.2:
+            executable_high_entropy += 1
+        section_payloads.append(
+            {
+                "name": name,
+                "virtual_address": f"0x{int(section.VirtualAddress):X}",
+                "virtual_size": int(section.Misc_VirtualSize),
+                "raw_size": int(section.SizeOfRawData),
+                "entropy": round(entropy, 3),
+                "executable": flags["executable"],
+                "readable": flags["readable"],
+                "writable": flags["writable"],
+                "suspicious_name": suspicious_name,
+            }
+        )
+
+    imports: list[dict[str, Any]] = []
+    imported_names: list[str] = []
+    if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            functions: list[str] = []
+            for imp in entry.imports:
+                if imp.name:
+                    decoded = imp.name.decode("ascii", errors="replace")
+                    functions.append(decoded)
+                    imported_names.append(decoded)
+            imports.append(
+                {
+                    "dll": entry.dll.decode("ascii", errors="replace"),
+                    "function_count": len(functions),
+                    "functions_preview": functions[:16],
+                }
+            )
+
+    import_hits = sorted({name for name in imported_names if name in PACKER_API_HINTS})
+    indicator_items: list[dict[str, Any]] = []
+    score = 0
+
+    if any(name.lower() in (".vmp0", ".vmp1", ".vmp2") for name in suspicious_section_names):
+        indicator_items.append({"weight": 8, "reason": "classic VMProtect section names present"})
+        score += 8
+    elif any("vmp" in name.lower() for name in suspicious_section_names):
+        indicator_items.append({"weight": 6, "reason": "section names look VMProtect-like"})
+        score += 6
+
+    if executable_high_entropy:
+        indicator_items.append(
+            {
+                "weight": 3,
+                "reason": f"{executable_high_entropy} executable section(s) have high entropy",
+            }
+        )
+        score += 3
+
+    if entry_section_name and entry_section_name.lower() not in (".text", "text"):
+        indicator_items.append(
+            {
+                "weight": 2,
+                "reason": f"entry point is in non-standard section {entry_section_name}",
+            }
+        )
+        score += 2
+
+    if len(imported_names) <= 24 and len(import_hits) >= 3:
+        indicator_items.append(
+            {
+                "weight": 4,
+                "reason": "small import table dominated by loader/protection APIs",
+            }
+        )
+        score += 4
+    elif import_hits:
+        indicator_items.append(
+            {
+                "weight": 1,
+                "reason": f"packer-related imports present: {', '.join(import_hits[:6])}",
+            }
+        )
+        score += 1
+
+    if _pe_has_tls_callbacks(pe):
+        indicator_items.append({"weight": 2, "reason": "TLS callbacks present"})
+        score += 2
+
+    if _pe_directory_size(pe, "IMAGE_DIRECTORY_ENTRY_BASERELOC") == 0 and executable_high_entropy:
+        indicator_items.append({"weight": 1, "reason": "relocations stripped alongside packed-like sections"})
+        score += 1
+
+    label = "likely_unpacked"
+    confidence = "low"
+    if any(name.lower() in (".vmp0", ".vmp1", ".vmp2") for name in suspicious_section_names):
+        label = "likely_vmp"
+        confidence = "high"
+    elif score >= 10:
+        label = "vmp_like_or_custom_vm"
+        confidence = "medium"
+    elif score >= 6:
+        label = "generic_packed"
+        confidence = "medium"
+    elif score >= 3:
+        label = "possibly_protected"
+        confidence = "low"
+
+    return {
+        "file_path": str(path),
+        "sha256": sha256,
+        "size": len(raw),
+        "machine": hex(int(pe.FILE_HEADER.Machine)),
+        "image_base": f"0x{int(pe.OPTIONAL_HEADER.ImageBase):X}",
+        "entry_point": f"0x{int(pe.OPTIONAL_HEADER.ImageBase) + entry_rva:X}",
+        "entry_section": entry_section_name or None,
+        "section_count": len(section_payloads),
+        "sections": section_payloads,
+        "import_dll_count": len(imports),
+        "import_function_count": len(imported_names),
+        "imports_preview": imports[:12],
+        "tls_callbacks_present": _pe_has_tls_callbacks(pe),
+        "packer_api_hits": import_hits,
+        "indicators": indicator_items,
+        "classification": {
+            "label": label,
+            "confidence": confidence,
+            "score": score,
+            "heuristic": True,
+        },
+    }
+
+
 @mcp.tool()
 def health() -> dict[str, Any]:
     """Return server health and connection state."""
@@ -1216,7 +1821,14 @@ def run_until_expr(
 
 
 @mcp.tool()
-def run_to(address_or_symbol: int | str, timeout: int = 10, clear_on_timeout: bool = True) -> dict[str, Any]:
+def run_to(
+    address_or_symbol: int | str,
+    timeout: int = 10,
+    clear_on_timeout: bool = True,
+    continue_on_unrelated_stop: bool = True,
+    max_unrelated_stops: int = 16,
+    include_unrelated_stops: bool = False,
+) -> dict[str, Any]:
     """Run until address/symbol is reached via a temporary software breakpoint."""
     parsed = _parse_address_or_symbol(address_or_symbol)
     if parsed is None:
@@ -1234,26 +1846,82 @@ def run_to(address_or_symbol: int | str, timeout: int = 10, clear_on_timeout: bo
             bp_type=StandardBreakpointType.SingleShotInt3,
             singleshoot=True,
         )
+        breakpoint_snapshot = _snapshot_breakpoints(client)
         client.go()
-        wait_result = _wait_for_running_state(
-            expect_running=False,
-            timeout=timeout,
-            clear_stale_events=False,
-            include_events=True,
-        )
-        stopped = bool(wait_result.get("matched"))
-        ip_value = wait_result.get("instruction_pointer_value")
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        unrelated_stops: list[dict[str, Any]] = []
+        safe_max_unrelated_stops = max(0, int(max_unrelated_stops))
+        wait_result: dict[str, Any] = {
+            "matched": False,
+            "timed_out": True,
+            "expected_running": False,
+            "is_running": True,
+            "elapsed_ms": 0,
+        }
         reached = False
-        if stopped and target_address is not None and isinstance(ip_value, int):
-            reached = ip_value == target_address
-        if not reached and stopped and target_address is not None:
-            stop_event = wait_result.get("stop_event")
-            if isinstance(stop_event, dict):
-                event_data = stop_event.get("event_data")
-                if isinstance(event_data, dict):
-                    stop_addr = event_data.get("addr")
-                    if isinstance(stop_addr, int):
-                        reached = stop_addr == target_address
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                wait_result = _wait_for_running_state(
+                    expect_running=False,
+                    timeout=0,
+                    clear_stale_events=False,
+                    include_events=True,
+                )
+                break
+
+            wait_result = _wait_for_running_state(
+                expect_running=False,
+                timeout=max(0.1, remaining),
+                clear_stale_events=False,
+                include_events=True,
+            )
+            ip_value = wait_result.get("instruction_pointer_value")
+            if isinstance(ip_value, int):
+                snapshot_match = breakpoint_snapshot.get(ip_value, [])
+                if snapshot_match:
+                    wait_result = _apply_breakpoint_inference(
+                        wait_result,
+                        snapshot_match,
+                        source="breakpoint_snapshot",
+                    )
+            reached = _did_hit_target(wait_result, target_address)
+            if reached and wait_result.get("stop_reason") in ("unknown", "paused", None):
+                target_match: list[dict[str, Any]] = []
+                if isinstance(ip_value, int):
+                    target_match = breakpoint_snapshot.get(ip_value, [])
+                if not target_match and isinstance(target_address, int) and isinstance(ip_value, int) and ip_value == target_address:
+                    target_match = [
+                        {
+                            "addr": target_address,
+                            "type": int(BreakpointType.BpNormal.value),
+                            "name": f"run_to_0x{target_address:X}",
+                            "mod": "",
+                            "detail": "software",
+                        }
+                    ]
+                if target_match:
+                    wait_result = _apply_breakpoint_inference(
+                        wait_result,
+                        target_match,
+                        source="run_to_target_match",
+                    )
+            if reached:
+                break
+            if not bool(wait_result.get("matched")) or bool(wait_result.get("timed_out")):
+                break
+            if not continue_on_unrelated_stop:
+                break
+
+            unrelated_stops.append(_compact_stop_summary(wait_result))
+            if len(unrelated_stops) >= safe_max_unrelated_stops:
+                wait_result = dict(wait_result)
+                wait_result["max_unrelated_stops_reached"] = True
+                break
+
+            breakpoint_snapshot = _snapshot_breakpoints(client)
+            client.go()
 
         temporary_breakpoint_cleared = False
         if bool(wait_result.get("timed_out")) and clear_on_timeout:
@@ -1267,7 +1935,10 @@ def run_to(address_or_symbol: int | str, timeout: int = 10, clear_on_timeout: bo
             "target_address": f"0x{target_address:X}" if isinstance(target_address, int) else None,
             "reached": reached,
             "temporary_breakpoint_cleared": temporary_breakpoint_cleared,
+            "unrelated_stop_count": len(unrelated_stops),
         }
+        if include_unrelated_stops and unrelated_stops:
+            payload["unrelated_stops"] = unrelated_stops
         payload.update(wait_result)
         return payload
 
@@ -1361,15 +2032,25 @@ def _wait_for_running_state(
                 "is_running": running,
                 "elapsed_ms": int((time.monotonic() - start) * 1000),
             }
+            if expect_running:
+                payload["running_observed"] = True
+                payload["transient_running"] = False
             if not expect_running:
+                ip: int | None = None
+                try:
+                    ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+                except Exception:
+                    ip = None
                 payload.update(
                     _collect_stop_details(
                         _require_client(),
                         include_events=include_events,
+                        instruction_pointer_value=ip,
                     )
                 )
                 try:
-                    ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+                    if ip is None:
+                        ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
                     payload["instruction_pointer"] = f"0x{ip:X}"
                     payload["instruction_pointer_value"] = ip
                     payload["instruction"] = _require_client().disassemble_at(ip)
@@ -1399,15 +2080,61 @@ def _wait_for_running_state(
         "elapsed_ms": int((time.monotonic() - start) * 1000),
         "forced_pause": forced_pause,
     }
+    if expect_running:
+        payload["running_observed"] = False
+        payload["transient_running"] = False
+    if expect_running and not final_running:
+        ip = None
+        try:
+            ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+        except Exception:
+            ip = None
+        drained_events = _drain_debug_events(_require_client())
+        events_since_resume = _events_since_last_resume(drained_events)
+        saw_resume_event = any(
+            item.event_type == EventType.EVENT_RESUME_DEBUG for item in drained_events
+        )
+        transient_stop = _build_stop_details_from_events(
+            _require_client(),
+            events_since_resume,
+            include_events=include_events,
+            instruction_pointer_value=ip,
+        )
+        inferred_stop = transient_stop.get("stop_reason") not in (None, "unknown")
+        has_post_resume_activity = len(events_since_resume) > 1
+        if saw_resume_event and (has_post_resume_activity or inferred_stop):
+            payload.update(transient_stop)
+            payload["matched"] = True
+            payload["timed_out"] = False
+            payload["running_observed"] = True
+            payload["transient_running"] = True
+            if ip is not None:
+                try:
+                    payload["instruction_pointer"] = f"0x{ip:X}"
+                    payload["instruction_pointer_value"] = ip
+                    payload["instruction"] = _require_client().disassemble_at(ip)
+                except Exception:
+                    payload["instruction"] = None
+            return payload
+        if saw_resume_event:
+            payload["saw_resume_event"] = True
+
     if not expect_running:
+        ip = None
+        try:
+            ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+        except Exception:
+            ip = None
         payload.update(
             _collect_stop_details(
                 _require_client(),
                 include_events=include_events,
+                instruction_pointer_value=ip,
             )
         )
         try:
-            ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
+            if ip is None:
+                ip = _read_first_register(_require_client(), ("cip", "rip", "eip"))
             payload["instruction_pointer"] = f"0x{ip:X}"
             payload["instruction_pointer_value"] = ip
             payload["instruction"] = _require_client().disassemble_at(ip)
@@ -1746,10 +2473,40 @@ def write_memory_hex(address: int | str, hex_data: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def disassemble(address: int | str) -> dict[str, Any]:
-    """Disassemble instruction at an address."""
+def disassemble(address: int | str, count: int = 1) -> dict[str, Any]:
+    """Disassemble one or more instructions at an address."""
     parsed_address = _parse_int(address, allow_expression=True)
-    return _run(lambda: _require_client().disassemble_at(parsed_address))
+    safe_count = max(1, min(int(count), 256))
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        if safe_count == 1:
+            return client.disassemble_at(parsed_address)
+
+        instructions: list[dict[str, Any]] = []
+        current = parsed_address
+        for _ in range(safe_count):
+            item = client.disassemble_at(current)
+            if item is None:
+                break
+            entry = _to_jsonable(item)
+            if isinstance(entry, dict):
+                entry["address"] = f"0x{current:X}"
+            instructions.append(entry)
+            instr_size = getattr(item, "instr_size", 0)
+            if not isinstance(instr_size, int) or instr_size <= 0:
+                break
+            current += instr_size
+
+        return {
+            "address": f"0x{parsed_address:X}",
+            "count": safe_count,
+            "decoded": len(instructions),
+            "truncated": len(instructions) < safe_count,
+            "instructions": instructions,
+        }
+
+    return _run(action)
 
 
 @mcp.tool()
@@ -1776,6 +2533,225 @@ def memory_map(max_entries: int = 256) -> dict[str, Any]:
             "total": len(pages),
             "truncated": len(pages) > max_entries_safe,
             "pages": pages[:max_entries_safe],
+        }
+
+    return _run(action)
+
+
+@mcp.tool()
+def profile_pe(file_path: str) -> dict[str, Any]:
+    """Statically profile a PE for VMP/VMP-like/generic packing indicators."""
+    return _run(lambda: _profile_pe_file_impl(file_path))
+
+
+@mcp.tool()
+def scan_suspicious_pages(
+    module_filter: str = "",
+    max_entries: int = 64,
+    executable_only: bool = True,
+    include_image: bool = True,
+    include_private: bool = True,
+    include_mapped: bool = False,
+    min_size: int = 0x1000,
+) -> dict[str, Any]:
+    """Scan runtime memory for executable/private/RWX pages useful for unpacking and malware analysis."""
+    safe_max_entries = max(1, min(int(max_entries), 512))
+    safe_min_size = max(0x1000, int(min_size))
+    module_filter_text = module_filter.strip().lower()
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        current_ip: int | None = None
+        current_ip_page = None
+        current_symbol = None
+        try:
+            current_ip = _read_first_register(client, ("cip", "rip", "eip"))
+            current_ip_page = client.virt_query(current_ip)
+            current_symbol = client.get_symbol_at(current_ip)
+        except Exception:
+            current_ip = None
+
+        matches: list[dict[str, Any]] = []
+        counts = {"image": 0, "private": 0, "mapped": 0}
+        for page in client.memmap():
+            payload = _page_payload(page)
+            if payload["region_size"] < safe_min_size:
+                continue
+            if executable_only and not payload["is_executable"]:
+                continue
+            page_type = payload["type_text"]
+            if page_type == "IMAGE" and not include_image:
+                continue
+            if page_type == "PRIVATE" and not include_private:
+                continue
+            if page_type == "MAPPED" and not include_mapped:
+                continue
+            if module_filter_text and module_filter_text not in str(payload["info"]).lower():
+                continue
+
+            score, reasons = _score_page_suspicion(payload, current_ip=current_ip)
+            payload["suspicion_score"] = score
+            payload["suspicion_reasons"] = reasons
+            if isinstance(current_ip, int):
+                base_address = payload["base_address_value"]
+                end_address = base_address + payload["region_size"]
+                if base_address <= current_ip < end_address:
+                    payload["current_ip_offset"] = current_ip - base_address
+            matches.append(payload)
+            if page_type.lower() in counts:
+                counts[page_type.lower()] += 1
+
+        matches.sort(
+            key=lambda item: (
+                int(item.get("suspicion_score", 0)),
+                int(item.get("is_writable", False)),
+                int(item.get("region_size", 0)),
+            ),
+            reverse=True,
+        )
+        top_matches = matches[:safe_max_entries]
+        response: dict[str, Any] = {
+            "total_candidates": len(matches),
+            "returned": len(top_matches),
+            "counts": counts,
+            "pages": top_matches,
+        }
+        if isinstance(current_ip, int):
+            response["current_ip"] = f"0x{current_ip:X}"
+        if current_ip_page is not None:
+            response["current_ip_page"] = _page_payload(current_ip_page)
+        if current_symbol is not None:
+            response["current_symbol"] = _to_jsonable(current_symbol)
+        main_pages = _main_module_pages(client)
+        if main_pages:
+            response["main_module_base"] = f"0x{int(getattr(main_pages[0], 'allocation_base', 0)):X}"
+            response["main_module_page_count"] = len(main_pages)
+        return response
+
+    return _run(action)
+
+
+@mcp.tool()
+def dump_memory_regions(
+    output_dir: str,
+    module_filter: str = "",
+    executable_only: bool = True,
+    include_image: bool = False,
+    include_private: bool = True,
+    include_mapped: bool = False,
+    include_current_ip_page: bool = True,
+    max_regions: int = 16,
+    max_region_size: int = 0x400000,
+) -> dict[str, Any]:
+    """Dump selected runtime memory regions to disk for unpacking and malware analysis."""
+    out_dir = Path(output_dir).expanduser()
+    safe_max_regions = max(1, min(int(max_regions), 128))
+    safe_max_region_size = max(0x1000, int(max_region_size))
+    module_filter_text = module_filter.strip().lower()
+
+    def action() -> dict[str, Any]:
+        client = _require_client()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        current_ip: int | None = None
+        if include_current_ip_page:
+            try:
+                current_ip = _read_first_register(client, ("cip", "rip", "eip"))
+            except Exception:
+                current_ip = None
+
+        selected: list[dict[str, Any]] = []
+        seen_pages: set[int] = set()
+        for page in client.memmap():
+            payload = _page_payload(page)
+            base_address = payload["base_address_value"]
+            if base_address in seen_pages:
+                continue
+            if payload["region_size"] <= 0 or payload["region_size"] > safe_max_region_size:
+                continue
+            if executable_only and not payload["is_executable"]:
+                continue
+            page_type = payload["type_text"]
+            if page_type == "IMAGE" and not include_image:
+                continue
+            if page_type == "PRIVATE" and not include_private:
+                continue
+            if page_type == "MAPPED" and not include_mapped:
+                continue
+            if module_filter_text and module_filter_text not in str(payload["info"]).lower():
+                continue
+            score, reasons = _score_page_suspicion(payload, current_ip=current_ip)
+            payload["suspicion_score"] = score
+            payload["suspicion_reasons"] = reasons
+            selected.append(payload)
+            seen_pages.add(base_address)
+
+        if include_current_ip_page and isinstance(current_ip, int):
+            current_page = client.virt_query(current_ip)
+            if current_page is not None:
+                payload = _page_payload(current_page)
+                base_address = payload["base_address_value"]
+                if base_address not in seen_pages and 0 < payload["region_size"] <= safe_max_region_size:
+                    score, reasons = _score_page_suspicion(payload, current_ip=current_ip)
+                    payload["suspicion_score"] = score
+                    payload["suspicion_reasons"] = reasons
+                    payload["forced_include"] = True
+                    selected.append(payload)
+                    seen_pages.add(base_address)
+
+        selected.sort(
+            key=lambda item: (
+                int(item.get("suspicion_score", 0)),
+                int(item.get("region_size", 0)),
+            ),
+            reverse=True,
+        )
+        selected = selected[:safe_max_regions]
+
+        dumped: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for index, page in enumerate(selected):
+            base_address = int(page["base_address_value"])
+            try:
+                data = _chunked_read_process_memory(client, base_address, int(page["region_size"]))
+                if not data:
+                    raise RuntimeError("empty dump")
+                type_text = str(page["type_text"]).lower()
+                protect_text = str(page["protect_text"]).replace("|", "-").lower()
+                filename = f"{index:02d}_0x{base_address:X}_{type_text}_{protect_text}.bin"
+                file_path = out_dir / filename
+                file_path.write_bytes(data)
+                dumped.append(
+                    {
+                        "file_path": str(file_path),
+                        "size": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "page": page,
+                    }
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "base_address": f"0x{base_address:X}",
+                        "error": str(exc),
+                    }
+                )
+
+        manifest = {
+            "output_dir": str(out_dir),
+            "dumped_count": len(dumped),
+            "error_count": len(errors),
+            "regions": dumped,
+            "errors": errors,
+        }
+        manifest_path = out_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "output_dir": str(out_dir),
+            "dumped_count": len(dumped),
+            "error_count": len(errors),
+            "manifest": str(manifest_path),
+            "regions": dumped,
+            "errors": errors,
         }
 
     return _run(action)

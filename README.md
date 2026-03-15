@@ -9,6 +9,9 @@
 1. `run_to` / `wait_until_stopped` 增加停下原因诊断
 - 可返回 `stop_reason`、`stop_event`、当前 `instruction_pointer`
 - `run_to` 不再“只要停下就算到达”，会校验是否真的命中目标地址
+- `run_to` 可自动跳过 TLS / 初始暂停 / 其他中间停点，直到真正到达目标或超时
+- 当事件队列里只有 `PAUSE` 或事件缺失时，会补充 `matched_breakpoints`、`instruction_page` 并尽量推断真实停因
+- `wait_until_running` 现在能识别“已经 resume 但又瞬间停下”的情况，并返回 `transient_running=true`
 
 2. 自动重连后恢复断点
 - MCP 记录通过工具下的软/硬件/内存断点
@@ -20,7 +23,16 @@
 - `drain_events`
 - `wait_for_event`
 
-4. 新增 CTF 输入卡住绕过工具
+4. `disassemble` 支持批量反汇编
+- 新增 `count` 参数，可一次展开多条指令
+- 适合快速看入口点、校验函数、解密后代码段
+
+5. 新增防护壳 / 病毒分析工具
+- `profile_pe`：静态识别 `likely_vmp` / `vmp_like_or_custom_vm` / `generic_packed`
+- `scan_suspicious_pages`：扫描私有可执行页、RWX 页、当前 IP 页
+- `dump_memory_regions`：把可执行嫌疑页直接落盘并生成 `manifest.json`
+
+6. 新增 CTF 输入卡住绕过工具
 - `write_text_memory`
 - `inject_string_and_continue`
 
@@ -122,6 +134,8 @@ xdbg-mcp
 - 执行：`go` `pause` `step_into` `step_over` `step_trace` `run_to` `run_until_expr`
 - 等待：`wait_until_running` `wait_until_stopped`
 - 观察：`snapshot_context` `get_register(s)` `read_memory` `disassemble`
+- 样本画像：`profile_pe` `scan_suspicious_pages`
+- 转储：`dump_memory_regions`
 - 断点：`set/clear/list_breakpoint` `set/clear_hardware_breakpoint` `set/clear_memory_breakpoint`
 - 内存：`write_memory_hex` `write_text_memory` `find_memory_pattern`
 - 事件：`get_latest_event` `drain_events` `wait_for_event`
@@ -147,6 +161,70 @@ xdbg-mcp
 
 2. 再用 `run_to` / `wait_until_stopped(detailed=true)` 看是否命中校验分支
 
+如果起步阶段会被 TLS / 系统暂停反复打断，可直接让 `run_to` 自动续跑：
+
+```json
+{
+  "address_or_symbol": "0x401550",
+  "continue_on_unrelated_stop": true,
+  "max_unrelated_stops": 32,
+  "include_unrelated_stops": true
+}
+```
+
+想快速展开一段代码时可直接：
+
+```json
+{
+  "address": "0x404ef0",
+  "count": 32
+}
+```
+
+调用工具：`disassemble`
+
+## VMP / 恶意样本工作流
+
+1. 先做静态画像，看是不是 VMP / 变种 / 泛型壳：
+
+```json
+{
+  "file_path": "D:\\sample.exe"
+}
+```
+
+调用工具：`profile_pe`
+
+2. 跑起来后扫描嫌疑页，看有没有私有执行页、RWX 页、当前 IP 落点：
+
+```json
+{
+  "max_entries": 32,
+  "include_image": true,
+  "include_private": true
+}
+```
+
+调用工具：`scan_suspicious_pages`
+
+3. 如果样本已经跑开或怀疑脱壳完成，直接落盘可执行页：
+
+```json
+{
+  "output_dir": "D:\\dump\\sample1",
+  "include_private": true,
+  "include_image": false,
+  "include_current_ip_page": true,
+  "max_regions": 8
+}
+```
+
+调用工具：`dump_memory_regions`
+
+说明：
+- 这些工具是为防御分析和脱壳定位准备的，不承诺“一键脱 VMP”
+- 对 VMP 变种，更可靠的信号通常是运行时页行为而不是固定节名
+
 ## 环境变量
 
 - `XDBG_MCP_AUTO_RECONNECT=1|0`：是否启用自动重连（默认 `1`）
@@ -163,11 +241,17 @@ xdbg-mcp
 
 2. `run_to` 未到达目标
 - 先看返回里的 `reached`、`stop_reason`、`instruction_pointer`
-- 若是命中其他断点，可清理后重试
+- 若是命中其他断点，可开启 `continue_on_unrelated_stop=true`
+- 需要诊断中途都停过哪里时，加上 `include_unrelated_stops=true`
+- 如果 `stop_reason_source=inferred`，说明事件队列本身不完整，但 MCP 已根据当前 IP 命中的断点表补做推断
 
 3. `wait_until_stopped` 超时
 - 可用 `pause_on_timeout=true`
 - 或用 `inject_string_and_continue` 跳过阻塞输入调用
+
+4. `wait_until_running` 返回 `false`，但你怀疑其实已经跑过
+- 现在可直接用 `wait_until_running(detailed=true)` 看 `running_observed` / `transient_running`
+- 如果 `transient_running=true`，说明目标确实 resume 过，只是很快又停在断点/异常/暂停上
 
 ## CTF 工作流文档
 
